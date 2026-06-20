@@ -21,6 +21,61 @@ vyp solves dependency resolution for Python projects with features not found in 
 - **Resolution Explain & Diff** — Trace version selections and compare lock files
 - **Space-efficient Cache** — Content-addressed metadata cache with LRU eviction
 
+## Why vyp over pip and uv?
+
+`pip` is the default but slow, with a backtracking resolver and no native lock
+file. `uv` is a fast, excellent general-purpose installer. vyp targets the cases
+those tools handle awkwardly: **conflict-aware resolution across multiple
+indexes**, with an extensible core — while staying competitive on speed.
+
+| | pip | uv | **vyp** |
+|---|---|---|---|
+| Implementation | Python | Rust | Rust |
+| Resolver | `resolvelib` backtracking | PubGrub | PubGrub (two-watched-literals) |
+| Human-readable conflict reports | basic | yes | yes (full derivation tree) |
+| Lock file | none (needs pip-tools) | `uv.lock` (tool-specific) | **PEP 751 `pylock.toml`** (standard) |
+| Transitive conflict declarations | ✗ | ✗ | **✓ propagate through the whole graph** |
+| Named index → transitive closure | ✗ | per-package pins | **✓ scoped to the dep's whole subtree** |
+| Package substitution | ✗ | ✗ | **✓ (`opencv-python` ⇄ `-headless`)** |
+| Unified overrides (range + pin, transitive) | constraints files | overrides | **✓ single declaration** |
+| Dependency provenance / `explain` | ✗ | partial | **✓ full causal chain** |
+| Plugin system (strategies / providers / filters) | ✗ | ✗ | **✓** |
+
+**What this buys you**
+
+- **Multi-index resolution that doesn't cross-contaminate.** Point a named index
+  (e.g. a PyTorch CUDA index) at `torch`, and vyp serves `torch` *and its entire
+  transitive closure* from there — but never reaches for that index when
+  resolving unrelated dependencies. No more stale mirror copies of PyPI packages
+  leaking in. See [Scoped named indexes](#scoped-named-indexes).
+- **Conflicts that travel.** A library can declare an incompatibility once and
+  have it enforced in every project that depends on it, instead of every
+  consumer rediscovering the same conflict by hand.
+- **Standards-first lock files.** vyp emits PEP 751 `pylock.toml`, readable by any
+  compliant tool — not a bespoke format.
+- **An extensible solver.** Custom conflict strategies, metadata providers, and
+  resolution filters plug in without forking the core PubGrub loop.
+
+### Performance
+
+vyp is built in Rust with fully parallel, lazy metadata fetching, a compact
+content-addressed cache, and a two-watched-literals PubGrub core. It is **orders
+of magnitude faster than pip** and **competitive with uv**.
+
+In the repository's 20-dependency benchmark (71 packages resolved), warm/cached
+resolution runs in roughly **100 ms** on our hardware — faster than `uv`'s
+equivalent offline resolve — and cold resolution is on par. Numbers are
+network- and machine-dependent; reproduce them yourself:
+
+```bash
+benchmarks/install-20-packages/run_benchmark.sh          # warm
+benchmarks/install-20-packages/run_benchmark.sh --cold   # cold
+```
+
+uv remains the more mature general-purpose tool (universal resolution, a large
+ecosystem, very fast installs); vyp's edge is the conflict- and index-aware
+resolution model above.
+
 ## Installation
 
 ```bash
