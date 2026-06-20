@@ -349,9 +349,20 @@ impl MetadataCache {
         index
     }
 
+    /// Reconcile metadata files on disk with the in-memory index.
+    ///
+    /// The index is persisted in batches, so a valid metadata file can exist
+    /// without a matching index entry (a missed flush, a crash, or a process
+    /// exiting before a background write was recorded). Because [`get`] looks an
+    /// entry up in the index before reading its file, such a file would never be
+    /// served — and the old behavior *deleted* it, causing a permanent cache
+    /// miss and re-fetch. Instead, **adopt** untracked metadata files back into
+    /// the index; only remove files that are unreadable or misnamed.
+    ///
+    /// [`get`]: MetadataCache::get
     fn reconcile_orphans(cache_dir: &Path, index: &mut CacheIndex) {
-        let tracked_hashes: std::collections::HashSet<&str> = index.entries.values()
-            .map(|e| e.hash.as_str())
+        let tracked_hashes: std::collections::HashSet<String> = index.entries.values()
+            .map(|e| e.hash.clone())
             .collect();
 
         let Ok(entries) = std::fs::read_dir(cache_dir) else { return };
@@ -360,10 +371,30 @@ impl MetadataCache {
             if fname == INDEX_FILE_NAME || fname.starts_with("versions-") {
                 continue;
             }
-            if !tracked_hashes.contains(fname.as_str()) {
-                tracing::debug!("removing orphaned cache file: {}", fname);
-                let _ = std::fs::remove_file(entry.path());
+            if tracked_hashes.contains(&fname) {
+                continue;
             }
+
+            let path = entry.path();
+            let Some(meta) = read_bin::<PackageMetadata>(&path) else {
+                // Unreadable or a stale/foreign format: safe to remove.
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            let key = Self::cache_key(meta.package.name(), &meta.version);
+            if Self::hash_key(&key) != fname {
+                // Filename doesn't address this content; not a usable entry.
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            index.entries.entry(key).or_insert(CacheEntry {
+                hash: fname,
+                package: meta.package.name().to_string(),
+                version: meta.version.to_string(),
+                size_bytes: size,
+                last_access: Self::now(),
+            });
         }
     }
 }
@@ -408,6 +439,34 @@ mod tests {
         cache.insert("test-pkg", &v, &meta);
         assert!(cache.get("test-pkg", &v).is_some());
         assert_eq!(cache.entry_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_orphan_metadata_file_is_adopted_not_deleted() {
+        // Simulates a missed index flush (process exited before the batched
+        // index write recorded a metadata file). Reopening must adopt the
+        // orphan file back into the index — not delete it — so the entry stays
+        // a cache hit instead of forcing a re-fetch.
+        let dir = temp_cache_dir();
+        let v = VypVersion::from_parts(3, 1, 0);
+        let meta = sample_metadata("orphan-pkg", &v);
+
+        {
+            let mut cache = MetadataCache::new(dir.clone());
+            cache.insert("orphan-pkg", &v, &meta);
+            cache.flush();
+        }
+        // Delete only the index, leaving the metadata blob orphaned on disk.
+        let _ = std::fs::remove_file(dir.join(INDEX_FILE_NAME));
+
+        let mut recovered = MetadataCache::new(dir.clone());
+        assert_eq!(recovered.entry_count(), 1, "orphan file should be adopted");
+        assert!(
+            recovered.get("orphan-pkg", &v).is_some(),
+            "adopted entry must be retrievable"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

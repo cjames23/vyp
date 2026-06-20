@@ -130,8 +130,13 @@ pub fn run(args: ResolveArgs) -> miette::Result<()> {
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(stderr, "\n--- vyp profile ---");
             let _ = writeln!(stderr, "Resolve:        {:>8.1}ms  ({} iterations)", timing.total_ms, timing.iterations);
-            let _ = writeln!(stderr, "  version wait: {:>8.1}ms  ({} fetches)", timing.version_wait_ms, timing.version_fetches);
-            let _ = writeln!(stderr, "  meta wait:    {:>8.1}ms  ({} fetches)", timing.metadata_wait_ms, timing.metadata_fetches);
+            let vdh = timing.provider_counters.get("version_disk_hits").copied().unwrap_or(0);
+            let v304 = timing.provider_counters.get("version_304s").copied().unwrap_or(0);
+            let vnet = timing.provider_counters.get("version_fresh_fetches").copied().unwrap_or(0);
+            let _ = writeln!(stderr, "  version wait: {:>8.1}ms  ({} fetches: {} disk, {} 304, {} network)", timing.version_wait_ms, timing.version_fetches, vdh, v304, vnet);
+            let mdh = timing.provider_counters.get("metadata_disk_hits").copied().unwrap_or(0);
+            let mnet = timing.provider_counters.get("metadata_network_fetches").copied().unwrap_or(0);
+            let _ = writeln!(stderr, "  meta wait:    {:>8.1}ms  ({} fetches: {} disk, {} network)", timing.metadata_wait_ms, timing.metadata_fetches, mdh, mnet);
             let _ = writeln!(stderr, "  solver:       {:>8.1}ms", timing.solver_ms);
             let _ = writeln!(stderr, "--- end profile ---");
         }

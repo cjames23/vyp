@@ -352,9 +352,15 @@ impl PyPIMetadataProvider {
                     });
                     let p = pkg;
                     let v = ver;
-                    tokio::task::spawn_blocking(move || {
+                    // Await the write so it isn't dropped when the runtime is
+                    // shut down at process exit. The solver already unblocked
+                    // via set_metadata above, so this does not slow resolution —
+                    // it only guarantees the entry is persisted, avoiding a
+                    // permanent cache miss (and re-fetch) on subsequent runs.
+                    let _ = tokio::task::spawn_blocking(move || {
                         disk_cache.lock().expect("poisoned").insert(&p, &v, &meta);
-                    });
+                    })
+                    .await;
                 }
                 None => {
                     idx.set_metadata(&pkg, &ver, MetadataResult {
