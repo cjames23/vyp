@@ -22,8 +22,9 @@ Homepage = "https://vyp.dev"
 Repository = "https://github.com/vyp-lang/vyp"
 Documentation = "https://vyp.dev"
 
-[project.scripts]
-vyp = "vyp:main"
+# Note: no `[project.scripts]` — with `bindings = "bin"` maturin installs the
+# Rust binary directly as the `vyp` command. Defining a console-script entry
+# point as well makes maturin fail ("scripts and a binary don't mix").
 
 [tool.maturin]
 bindings = "bin"

@@ -34,6 +34,7 @@ impl WheelCache {
         self.base_dir.join("tmp")
     }
 
+    #[allow(dead_code)]
     pub fn get_archive(&self, key: &str) -> Option<PathBuf> {
         self.get_archive_with_file_list(key).map(|(path, _)| path)
     }
