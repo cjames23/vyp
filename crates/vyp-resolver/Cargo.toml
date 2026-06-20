@@ -1,0 +1,11 @@
+[package]
+name = "vyp-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure PubGrub dependency resolver algorithm for vyp"
+
+[dependencies]
+vyp-api = { workspace = true }
+version-ranges = { workspace = true }
+indexmap = { workspace = true }

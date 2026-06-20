@@ -1,0 +1,98 @@
+site_name: vyp
+site_description: Transitive-conflict-aware Python dependency resolver
+site_url: https://vyp.dev
+repo_url: https://github.com/vyp-lang/vyp
+repo_name: vyp-lang/vyp
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - macros
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - First Steps: getting-started/first-steps.md
+  - Guides:
+      - Projects: guides/projects.md
+      - Dependencies: guides/dependencies.md
+      - Lock Files: guides/lockfiles.md
+      - Overrides & Conflicts: guides/overrides.md
+      - PyTorch: guides/pytorch.md
+      - Package Indexes: guides/indexes.md
+      - Plugins: guides/plugins.md
+      - Troubleshooting: guides/troubleshooting.md
+  - Concepts:
+      - Resolution: concepts/resolution.md
+      - Transitive Conflicts: concepts/transitive-conflicts.md
+      - Provenance: concepts/provenance.md
+      - Substitutions: concepts/substitutions.md
+      - Caching: concepts/caching.md
+      - Wheel Variants: concepts/wheel-variants.md
+  - Configuration:
+      - pyproject.toml: configuration/pyproject.md
+      - Environment Variables: configuration/environment.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Lock File Format: reference/lockfile-format.md
+      - Overrides Export Format: reference/conflict-overrides-format.md
+      - Plugin API: reference/api.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Architecture: development/architecture.md
+      - Future Improvements: development/future-improvements.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/vyp-lang/vyp

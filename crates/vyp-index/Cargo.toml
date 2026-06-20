@@ -1,0 +1,17 @@
+[package]
+name = "vyp-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PyPI index client, in-memory index, and metadata cache for vyp"
+
+[dependencies]
+vyp-api = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+flate2 = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vyp"
+version = "0.1.0"
+description = "Transitive-conflict-aware Python dependency resolver"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Software Distribution",
+]
+
+[project.urls]
+Homepage = "https://vyp.dev"
+Repository = "https://github.com/vyp-lang/vyp"
+Documentation = "https://vyp.dev"
+
+[project.scripts]
+vyp = "vyp:main"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/vyp/Cargo.toml"
+python-source = "python"
+strip = true

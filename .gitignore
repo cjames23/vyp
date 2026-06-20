@@ -1,0 +1,29 @@
+/target
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.egg
+
+# Maturin / build
+wheels/
+
+# Environment
+.env
+.venv/
+.docs-venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.cursor/
+*.swp
+*.swo

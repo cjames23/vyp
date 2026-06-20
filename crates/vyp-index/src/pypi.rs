@@ -1,0 +1,1210 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
+use vyp_api::traits::metadata_provider::{MetadataProvider, PackageMetadata, PackageVersions};
+use vyp_api::{IndexScope, MarkerEnvironment, VypPackage, VypVersion, ConflictSet, Requirement};
+
+use crate::in_memory_index::{InMemoryIndex, MetadataResult, VersionsResult, WheelInfo};
+use crate::wheel_compat::PlatformTags;
+use crate::wheel_metadata::fetch_wheel_metadata;
+
+const MAX_CONCURRENT_FETCHES: usize = 500;
+
+/// Counters for profiling cache/network behaviour during resolution.
+#[derive(Debug, Default)]
+pub struct ProfileCounters {
+    pub version_disk_hits: usize,
+    pub version_304s: usize,
+    pub version_fresh_fetches: usize,
+    pub metadata_disk_hits: usize,
+    pub metadata_network_fetches: usize,
+}
+
+/// PyPI Simple API v1+JSON metadata provider.
+///
+/// Uses a multi-threaded tokio runtime for all async HTTP I/O. The solver
+/// thread calls the synchronous `MetadataProvider` trait methods which use
+/// `runtime.block_on()` to drive async requests on the runtime's worker
+/// threads. This avoids the deadlock that occurs with a `current_thread`
+/// runtime where `block_on` and the I/O driver share the same thread.
+pub struct PyPIMetadataProvider {
+    provider_name: String,
+    index_url: String,
+    /// When set, restricts this index to packages the scope allows. `None`
+    /// means an unscoped (primary) index that serves every package.
+    scope: Option<Arc<dyn IndexScope>>,
+    index: Arc<InMemoryIndex>,
+    client: reqwest::Client,
+    runtime: Option<tokio::runtime::Runtime>,
+    disk_cache: Arc<Mutex<crate::cache::MetadataCache>>,
+    marker_env: MarkerEnvironment,
+    semaphore: Arc<Semaphore>,
+    profile_counters: Arc<Mutex<ProfileCounters>>,
+}
+
+impl Drop for PyPIMetadataProvider {
+    fn drop(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            rt.shutdown_timeout(Duration::from_secs(2));
+        }
+    }
+}
+
+impl std::fmt::Debug for PyPIMetadataProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyPIMetadataProvider")
+            .field("provider_name", &self.provider_name)
+            .field("index_url", &self.index_url)
+            .finish()
+    }
+}
+
+impl PyPIMetadataProvider {
+    pub fn new(index_url: &str) -> Self {
+        Self::with_name("pypi", index_url, None)
+    }
+
+    pub fn with_name(
+        name: &str,
+        index_url: &str,
+        scope: Option<Arc<dyn IndexScope>>,
+    ) -> Self {
+        Self::with_name_and_env(name, index_url, scope, None)
+    }
+
+    pub fn with_name_and_env(
+        name: &str,
+        index_url: &str,
+        scope: Option<Arc<dyn IndexScope>>,
+        marker_env: Option<MarkerEnvironment>,
+    ) -> Self {
+        Self::with_name_env_client(name, index_url, scope, marker_env, None)
+    }
+
+    /// Full constructor: accepts an optional external HTTP client for sharing
+    /// connections between the resolver and installer.
+    pub fn with_name_env_client(
+        name: &str,
+        index_url: &str,
+        scope: Option<Arc<dyn IndexScope>>,
+        marker_env: Option<MarkerEnvironment>,
+        shared_client: Option<reqwest::Client>,
+    ) -> Self {
+        let cache_dir = Self::default_cache_dir();
+        let disk_cache = Arc::new(Mutex::new(crate::cache::MetadataCache::new(cache_dir)));
+        let index = Arc::new(InMemoryIndex::new());
+        let marker_env = marker_env.unwrap_or_else(MarkerEnvironment::current);
+        let index_url_owned = index_url.trim_end_matches('/').to_string();
+
+        let client = shared_client.unwrap_or_else(Self::build_default_client);
+
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(num_workers)
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+
+        Self {
+            provider_name: name.to_string(),
+            index_url: index_url_owned,
+            scope,
+            index,
+            client,
+            runtime: Some(runtime),
+            disk_cache,
+            marker_env,
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)),
+            profile_counters: Arc::new(Mutex::new(ProfileCounters::default())),
+        }
+    }
+
+    /// Return the underlying HTTP client. `reqwest::Client` is `Arc`-based so
+    /// cloning is cheap. Used to share TLS sessions between resolve and install.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
+    pub fn build_default_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .user_agent(format!("vyp/{}", env!("CARGO_PKG_VERSION")))
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .http2_initial_stream_window_size(2 * 1024 * 1024)
+            .http2_initial_connection_window_size(4 * 1024 * 1024)
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .build()
+            .expect("failed to build HTTP client")
+    }
+
+    pub fn pypi() -> Self {
+        Self::new("https://pypi.org/simple")
+    }
+
+    pub fn url(&self) -> &str {
+        &self.index_url
+    }
+
+    pub fn profile_counters(&self) -> Arc<Mutex<ProfileCounters>> {
+        Arc::clone(&self.profile_counters)
+    }
+
+    fn default_cache_dir() -> std::path::PathBuf {
+        dirs_or_default().join("vyp").join("cache").join("metadata")
+    }
+
+    fn matches_filter(&self, package: &str) -> bool {
+        match &self.scope {
+            None => true,
+            Some(scope) => scope.allows(package),
+        }
+    }
+
+    /// Ensure a version-list fetch is in progress for this package.
+    /// Does NOT block the solver thread at all — spawns an async task
+    /// that checks disk cache and falls back to HTTP. The solver should
+    /// call `index.wait_versions()` to block on the Notify.
+    fn ensure_versions_fetching(&self, normalized: &str) {
+        if self.index.try_get_versions(normalized).is_some() {
+            return;
+        }
+
+        if !self.index.register_versions(normalized) {
+            return;
+        }
+
+        // Everything else runs in an async task — no disk I/O on the solver thread.
+        let client = self.client.clone();
+        let index_url = self.index_url.clone();
+        let index = Arc::clone(&self.index);
+        let disk_cache = Arc::clone(&self.disk_cache);
+        let semaphore = Arc::clone(&self.semaphore);
+        let marker_env = self.marker_env.clone();
+        let counters = Arc::clone(&self.profile_counters);
+        let pkg = normalized.to_string();
+
+        self.runtime.as_ref().expect("runtime dropped").spawn(async move {
+            // Disk cache fast path (brief lock, no I/O, never held across .await).
+            {
+                let cache = disk_cache.lock().expect("poisoned");
+                if let Some((versions, stored_wheel_info)) = cache.get_versions_full(&pkg) {
+                    drop(cache);
+                    if let Ok(mut c) = counters.lock() { c.version_disk_hits += 1; }
+                    let wheel_info = stored_wheel_info.into_iter()
+                        .filter_map(|(v_str, wheels)| {
+                            v_str.parse::<VypVersion>().ok().map(|v| (v, wheels))
+                        })
+                        .collect();
+                    index.set_versions(&pkg, VersionsResult {
+                        versions,
+                        wheel_info,
+                    });
+                    return;
+                }
+            }
+
+            // Stale cache — conditional request path.
+            let stale = disk_cache.lock().expect("poisoned")
+                .get_versions_with_validators(&pkg);
+
+            if let Some((versions, etag, lm, stale_wheel_info)) = stale {
+                match fetch_versions_async(
+                    &client, &index_url, &pkg, &semaphore,
+                    etag.as_deref(), lm.as_deref(),
+                ).await {
+                    Ok(FetchVersionsOutcome::NotModified) => {
+                        if let Ok(mut c) = counters.lock() { c.version_304s += 1; }
+                        let wheel_info = stale_wheel_info.into_iter()
+                            .filter_map(|(v_str, wheels)| {
+                                v_str.parse::<VypVersion>().ok().map(|v| (v, wheels))
+                            })
+                            .collect();
+                        index.set_versions(&pkg, VersionsResult {
+                            versions,
+                            wheel_info,
+                        });
+                        let cache = Arc::clone(&disk_cache);
+                        let p = pkg.clone();
+                        tokio::task::spawn_blocking(move || {
+                            cache.lock().expect("poisoned")
+                                .refresh_versions_timestamp(&p);
+                        });
+                        return;
+                    }
+                    Ok(fresh @ FetchVersionsOutcome::Fresh { .. }) => {
+                        if let Ok(mut c) = counters.lock() { c.version_fresh_fetches += 1; }
+                        Self::handle_fresh_versions(
+                            fresh, &pkg, &client, &index, &disk_cache,
+                            &semaphore, &marker_env, &counters,
+                        ).await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::debug!("conditional fetch failed for {}: {}", pkg, e);
+                        index.set_versions(&pkg, VersionsResult {
+                            versions: Vec::new(),
+                            wheel_info: HashMap::new(),
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // No cache at all — full HTTP fetch.
+            if let Ok(mut c) = counters.lock() { c.version_fresh_fetches += 1; }
+            match fetch_versions_async(
+                &client, &index_url, &pkg, &semaphore, None, None,
+            ).await {
+                Ok(fresh @ FetchVersionsOutcome::Fresh { .. }) => {
+                    Self::handle_fresh_versions(
+                        fresh, &pkg, &client, &index, &disk_cache,
+                        &semaphore, &marker_env, &counters,
+                    ).await;
+                }
+                Ok(FetchVersionsOutcome::NotModified) => {
+                    index.set_versions(&pkg, VersionsResult {
+                        versions: Vec::new(),
+                        wheel_info: HashMap::new(),
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!("failed to fetch versions for {}: {}", pkg, e);
+                    index.set_versions(&pkg, VersionsResult {
+                        versions: Vec::new(),
+                        wheel_info: HashMap::new(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Ensure a metadata fetch is in progress for this package version.
+    /// Does NOT block the solver thread — spawns an async task.
+    fn ensure_metadata_fetching(&self, normalized: &str, version: &VypVersion) {
+        if self.index.try_get_metadata(normalized, version).is_some() {
+            return;
+        }
+
+        if !self.index.register_metadata(normalized, version) {
+            return;
+        }
+
+        // Two ways to obtain METADATA: a PEP 658 sidecar (preferred, one cheap
+        // GET) or, for indexes without it (e.g. download.pytorch.org), a range
+        // request into any wheel of this version.
+        let wheels = self.index.get_wheel_info(normalized, version);
+        let pep658_url = wheels.as_ref().and_then(|ws| {
+            ws.iter().find(|w| w.has_metadata).map(|w| w.url.clone())
+        });
+        let range_wheel_url = wheels.as_ref().and_then(|ws| best_wheel_url(ws, &self.marker_env));
+
+        let client = self.client.clone();
+        let idx = Arc::clone(&self.index);
+        let disk_cache = Arc::clone(&self.disk_cache);
+        let env = self.marker_env.clone();
+        let sem = Arc::clone(&self.semaphore);
+        let counters = Arc::clone(&self.profile_counters);
+        let pkg = normalized.to_string();
+        let ver = version.clone();
+
+        self.runtime.as_ref().expect("runtime dropped").spawn(async move {
+            let cached = disk_cache.lock().expect("poisoned").get(&pkg, &ver);
+
+            if let Some(cached_meta) = cached {
+                if let Ok(mut c) = counters.lock() { c.metadata_disk_hits += 1; }
+                idx.set_metadata(&pkg, &ver, MetadataResult {
+                    dependencies: cached_meta.dependencies.clone(),
+                    full_metadata: Some(cached_meta),
+                });
+                return;
+            }
+
+            if let Ok(mut c) = counters.lock() { c.metadata_network_fetches += 1; }
+
+            // Prefer PEP 658; fall back to a ranged wheel fetch.
+            let fetched: Option<PackageMetadata> = if let Some(ref url) = pep658_url {
+                let metadata_url = format!("{}.metadata", url);
+                fetch_metadata_async(&client, &metadata_url, &pkg, &ver, &env, &sem).await.ok()
+            } else if let Some(ref wheel_url) = range_wheel_url {
+                match fetch_wheel_metadata(&client, wheel_url, &sem).await {
+                    Ok(text) => Some(metadata_from_text(&text, &pkg, &ver, &env, wheel_url.clone())),
+                    Err(e) => {
+                        tracing::debug!("range metadata fetch failed for {}=={}: {}", pkg, ver, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            match fetched {
+                Some(meta) => {
+                    idx.set_metadata(&pkg, &ver, MetadataResult {
+                        dependencies: meta.dependencies.clone(),
+                        full_metadata: Some(meta.clone()),
+                    });
+                    let p = pkg;
+                    let v = ver;
+                    tokio::task::spawn_blocking(move || {
+                        disk_cache.lock().expect("poisoned").insert(&p, &v, &meta);
+                    });
+                }
+                None => {
+                    idx.set_metadata(&pkg, &ver, MetadataResult {
+                        dependencies: Vec::new(),
+                        full_metadata: None,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Process a fresh version response: populate index, cache to disk,
+    /// and chain metadata prefetches for the most likely candidate versions.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_fresh_versions(
+        outcome: FetchVersionsOutcome,
+        pkg: &str,
+        client: &reqwest::Client,
+        index: &Arc<InMemoryIndex>,
+        disk_cache: &Arc<Mutex<crate::cache::MetadataCache>>,
+        semaphore: &Arc<Semaphore>,
+        marker_env: &MarkerEnvironment,
+        counters: &Arc<Mutex<ProfileCounters>>,
+    ) {
+        let FetchVersionsOutcome::Fresh { result, etag, last_modified } = outcome else {
+            return;
+        };
+
+        let mut candidates: Vec<(VypVersion, String)> = result.wheel_info.iter()
+            .filter_map(|(v, wheels)| {
+                wheels.iter().find(|w| w.has_metadata)
+                    .map(|w| (v.clone(), w.url.clone()))
+            })
+            .collect();
+        candidates.sort_by(|(a, _), (b, _)| b.cmp(a));
+
+        // Speculatively prefetch metadata only for the few most-likely picks
+        // (highest versions) rather than the top 5. This trades a little extra
+        // latency on heavily-constrained resolves for far less wasted bandwidth
+        // and cache churn — the on-demand path covers any miss. Tunable via
+        // `VYP_PREFETCH_DEPTH`.
+        candidates.truncate(speculative_prefetch_depth());
+
+        let vers_for_cache = result.versions.clone();
+        let wheel_info_for_cache: HashMap<String, Vec<WheelInfo>> = result.wheel_info.iter()
+            .map(|(v, w)| (v.to_string(), w.clone()))
+            .collect();
+        index.set_versions(pkg, result);
+
+        {
+            let cache = Arc::clone(disk_cache);
+            let p = pkg.to_string();
+            tokio::task::spawn_blocking(move || {
+                cache.lock().expect("poisoned")
+                    .insert_versions(&p, &vers_for_cache, etag, last_modified, wheel_info_for_cache);
+            });
+        }
+
+        for (version, wheel_url) in candidates {
+            if !index.register_metadata(pkg, &version) {
+                continue;
+            }
+            let cached_meta = {
+                disk_cache.lock().expect("poisoned").get(pkg, &version)
+            };
+            if let Some(cached_meta) = cached_meta {
+                if let Ok(mut c) = counters.lock() { c.metadata_disk_hits += 1; }
+                index.set_metadata(pkg, &version, MetadataResult {
+                    dependencies: cached_meta.dependencies.clone(),
+                    full_metadata: Some(cached_meta),
+                });
+                continue;
+            }
+            if let Ok(mut c) = counters.lock() { c.metadata_network_fetches += 1; }
+            let idx = Arc::clone(index);
+            let cl = client.clone();
+            let env = marker_env.clone();
+            let sem = Arc::clone(semaphore);
+            let cache = Arc::clone(disk_cache);
+            let p = pkg.to_string();
+            let metadata_url = format!("{}.metadata", wheel_url);
+            tokio::spawn(async move {
+                match fetch_metadata_async(
+                    &cl, &metadata_url, &p, &version,
+                    &env, &sem,
+                ).await {
+                    Ok(meta) => {
+                        let deps = meta.dependencies.clone();
+                        idx.set_metadata(&p, &version, MetadataResult {
+                            dependencies: deps,
+                            full_metadata: Some(meta.clone()),
+                        });
+                        let v = version.clone();
+                        tokio::task::spawn_blocking(move || {
+                            cache.lock().expect("poisoned")
+                                .insert(&p, &v, &meta);
+                        });
+                    }
+                    Err(_) => {
+                        idx.set_metadata(&p, &version, MetadataResult {
+                            dependencies: Vec::new(),
+                            full_metadata: None,
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Fire-and-forget prefetch for a batch of packages. Each package
+    /// is handled by `ensure_versions_fetching` which spawns an async
+    /// task that fetches versions AND chains metadata for top candidates.
+    fn fire_prefetch(&self, packages: &[String]) {
+        for pkg_name in packages {
+            self.ensure_versions_fetching(pkg_name);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async HTTP fetch functions (Simple API v1+JSON only)
+// ---------------------------------------------------------------------------
+
+/// Result of a conditional HTTP fetch for version lists.
+enum FetchVersionsOutcome {
+    /// Server returned fresh data (200 OK).
+    Fresh {
+        result: VersionsResult,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+    /// Server confirmed the cache is still valid (304 Not Modified).
+    NotModified,
+}
+
+async fn fetch_versions_async(
+    client: &reqwest::Client,
+    index_url: &str,
+    normalized: &str,
+    semaphore: &Semaphore,
+    cached_etag: Option<&str>,
+    cached_last_modified: Option<&str>,
+) -> Result<FetchVersionsOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let _permit = semaphore.acquire().await.expect("semaphore closed");
+    let url = format!("{}/{}/", index_url, normalized);
+    let mut req = client
+        .get(&url)
+        .header("Accept", "application/vnd.pypi.simple.v1+json");
+
+    if let Some(etag) = cached_etag {
+        req = req.header("If-None-Match", etag);
+    }
+    if let Some(lm) = cached_last_modified {
+        req = req.header("If-Modified-Since", lm);
+    }
+
+    let response = req.send().await?;
+
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(FetchVersionsOutcome::NotModified);
+    }
+
+    if !response.status().is_success() {
+        return Ok(FetchVersionsOutcome::Fresh {
+            result: VersionsResult {
+                versions: Vec::new(),
+                wheel_info: HashMap::new(),
+            },
+            etag: None,
+            last_modified: None,
+        });
+    }
+
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let last_modified = response
+        .headers()
+        .get("last-modified")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let result = if content_type.contains("json") {
+        parse_json_simple_async(response).await?
+    } else {
+        let body = response.text().await?;
+        let versions = parse_html_versions(&body);
+        VersionsResult {
+            versions,
+            wheel_info: HashMap::new(),
+        }
+    };
+
+    Ok(FetchVersionsOutcome::Fresh {
+        result,
+        etag,
+        last_modified,
+    })
+}
+
+async fn parse_json_simple_async(
+    response: reqwest::Response,
+) -> Result<VersionsResult, Box<dyn std::error::Error + Send + Sync>> {
+    // Two-level deserialize: top-level extracts versions eagerly but
+    // defers individual file entries as RawValue, then only fully
+    // parses wheel files. This avoids allocating structs for the
+    // ~80-90% of file entries that are sdists/eggs.
+    #[derive(serde::Deserialize)]
+    struct SimpleJson<'a> {
+        #[serde(default)]
+        versions: Vec<String>,
+        #[serde(default, borrow)]
+        files: Vec<&'a serde_json::value::RawValue>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SimpleFile {
+        filename: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default, rename = "data-dist-info-metadata")]
+        data_dist_info_metadata: Option<serde_json::Value>,
+        #[serde(default, rename = "core-metadata")]
+        core_metadata: Option<serde_json::Value>,
+        #[serde(default, rename = "requires-python")]
+        requires_python: Option<String>,
+    }
+
+    let bytes = response.bytes().await?;
+    let json: SimpleJson = serde_json::from_slice(&bytes)?;
+
+    let mut version_set = HashSet::new();
+    let mut versions = Vec::new();
+    let mut wheel_info: HashMap<VypVersion, Vec<WheelInfo>> = HashMap::new();
+
+    if !json.versions.is_empty() {
+        for v_str in &json.versions {
+            if let Ok(v) = v_str.parse::<VypVersion>() {
+                if version_set.insert(v.to_string()) {
+                    versions.push(v);
+                }
+            }
+        }
+    }
+
+    for raw in &json.files {
+        let raw_str = raw.get();
+        // Quick string check to skip non-wheels without full deserialization
+        if !raw_str.contains(".whl") {
+            if json.versions.is_empty() {
+                // Fallback: extract version from any filename
+                if let Some(fname_start) = raw_str.find("\"filename\"") {
+                    if let Some(v) = extract_version_from_raw_filename(raw_str, fname_start) {
+                        if version_set.insert(v.to_string()) {
+                            versions.push(v);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let file: SimpleFile = match serde_json::from_str(raw_str) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        let has_metadata = file.core_metadata.as_ref()
+            .or(file.data_dist_info_metadata.as_ref())
+            .map(|v| match v {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Object(_) => true,
+                _ => false,
+            })
+            .unwrap_or(false);
+
+        if let Some(file_version) = extract_version_from_filename(&file.filename) {
+            if json.versions.is_empty() && version_set.insert(file_version.to_string()) {
+                versions.push(file_version.clone());
+            }
+
+            wheel_info
+                .entry(file_version)
+                .or_default()
+                .push(WheelInfo {
+                    filename: file.filename,
+                    url: file.url,
+                    has_metadata,
+                    requires_python: file.requires_python,
+                });
+        }
+    }
+
+    versions.sort();
+    Ok(VersionsResult {
+        versions,
+        wheel_info,
+    })
+}
+
+/// Quick version extraction from raw JSON without full deserialization.
+fn extract_version_from_raw_filename(raw: &str, fname_offset: usize) -> Option<VypVersion> {
+    let after = &raw[fname_offset..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if !rest.starts_with('"') { return None; }
+    let end = rest[1..].find('"')?;
+    let filename = &rest[1..1 + end];
+    extract_version_from_filename(filename)
+}
+
+/// Fetch METADATA from a Simple API `.metadata` URL and parse `Requires-Dist`.
+async fn fetch_metadata_async(
+    client: &reqwest::Client,
+    metadata_url: &str,
+    normalized: &str,
+    version: &VypVersion,
+    marker_env: &MarkerEnvironment,
+    semaphore: &Semaphore,
+) -> Result<PackageMetadata, Box<dyn std::error::Error + Send + Sync>> {
+    let _permit = semaphore.acquire().await.expect("semaphore closed");
+    let response = client.get(metadata_url).send().await?;
+    if !response.status().is_success() {
+        return Err(format!("metadata fetch failed: {}", response.status()).into());
+    }
+
+    let text = response.text().await?;
+    let dependencies = parse_metadata_requires_dist(&text, marker_env);
+
+    Ok(PackageMetadata {
+        package: VypPackage::named(normalized),
+        version: version.clone(),
+        dependencies,
+        conflict_declarations: ConflictSet::new(),
+        source: metadata_url.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pure parsing helpers (no I/O)
+// ---------------------------------------------------------------------------
+
+/// Parse RFC 822-style METADATA content to extract `Requires-Dist` entries,
+/// filtering by PEP 508 environment markers.
+pub fn parse_metadata_requires_dist(content: &str, marker_env: &MarkerEnvironment) -> Vec<Requirement> {
+    let mut deps = Vec::new();
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Requires-Dist:") {
+            let req_str = rest.trim();
+            if let Ok(req) = req_str.parse::<Requirement>() {
+                if should_include_requirement(&req, marker_env) {
+                    deps.push(req);
+                }
+            }
+        }
+    }
+    deps
+}
+
+fn parse_html_versions(body: &str) -> Vec<VypVersion> {
+    let mut versions = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in body.lines() {
+        if let Some(href_start) = line.find("href=\"") {
+            let rest = &line[href_start + 6..];
+            if let Some(href_end) = rest.find('"') {
+                let href = &rest[..href_end];
+                let filename = href.rsplit('/').next().unwrap_or(href);
+                let filename = filename.split('#').next().unwrap_or(filename);
+                if let Some(version) = extract_version_from_filename(filename) {
+                    if seen.insert(version.to_string()) {
+                        versions.push(version);
+                    }
+                }
+            }
+        }
+    }
+    versions
+}
+
+fn should_include_requirement(req: &Requirement, env: &MarkerEnvironment) -> bool {
+    match &req.marker {
+        None => true,
+        Some(tree) => tree.evaluate(env, &[]),
+    }
+}
+
+/// Number of top candidate versions to speculatively prefetch metadata for.
+/// Defaults to 2; override with `VYP_PREFETCH_DEPTH` (clamped to 1..=10).
+fn speculative_prefetch_depth() -> usize {
+    std::env::var("VYP_PREFETCH_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 10))
+        .unwrap_or(2)
+}
+
+/// Pick the URL of the most platform-compatible wheel, falling back to any
+/// wheel. A version's `METADATA` is identical across its wheels, so any wheel
+/// works as a metadata source for the ranged-fetch fallback.
+fn best_wheel_url(wheels: &[WheelInfo], env: &MarkerEnvironment) -> Option<String> {
+    let tags = PlatformTags::from_env(env);
+    let mut best: Option<(u32, &WheelInfo)> = None;
+    for w in wheels {
+        if !w.filename.ends_with(".whl") || !tags.is_compatible(&w.filename) {
+            continue;
+        }
+        let score = tags.compatibility_score(&w.filename);
+        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+            best = Some((score, w));
+        }
+    }
+    best.map(|(_, w)| w.url.clone()).or_else(|| {
+        wheels
+            .iter()
+            .find(|w| w.filename.ends_with(".whl"))
+            .map(|w| w.url.clone())
+    })
+}
+
+/// Build `PackageMetadata` from raw RFC 822 METADATA text.
+fn metadata_from_text(
+    text: &str,
+    normalized: &str,
+    version: &VypVersion,
+    env: &MarkerEnvironment,
+    source: String,
+) -> PackageMetadata {
+    PackageMetadata {
+        package: VypPackage::named(normalized),
+        version: version.clone(),
+        dependencies: parse_metadata_requires_dist(text, env),
+        conflict_declarations: ConflictSet::new(),
+        source,
+    }
+}
+
+fn dirs_or_default() -> std::path::PathBuf {
+    std::env::var("VYP_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                    std::path::PathBuf::from(home).join(".cache")
+                })
+        })
+}
+
+// ---------------------------------------------------------------------------
+// MetadataProvider trait implementation
+// ---------------------------------------------------------------------------
+
+impl MetadataProvider for PyPIMetadataProvider {
+    fn name(&self) -> &str {
+        &self.provider_name
+    }
+
+    fn priority(&self) -> i32 {
+        if self.scope.is_some() {
+            20
+        } else {
+            10
+        }
+    }
+
+    fn can_provide(&self, package: &VypPackage) -> bool {
+        if !matches!(package, VypPackage::Named(_)) {
+            return false;
+        }
+        self.matches_filter(package.name())
+    }
+
+    fn available_versions(
+        &self,
+        package: &VypPackage,
+    ) -> Result<Option<PackageVersions>, Box<dyn std::error::Error + Send + Sync>> {
+        let normalized = package.name().to_lowercase().replace(['-', '.'], "_");
+        // Ensure fetch is in progress (non-blocking spawn).
+        self.ensure_versions_fetching(&normalized);
+        // Block the solver thread on the Notify until data arrives.
+        let result = self.index.wait_versions(&normalized);
+
+        if result.versions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PackageVersions {
+                package: package.clone(),
+                versions: result.versions.clone(),
+            }))
+        }
+    }
+
+    fn get_metadata(
+        &self,
+        package: &VypPackage,
+        version: &VypVersion,
+    ) -> Result<Option<PackageMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        let normalized = package.name().to_lowercase().replace(['-', '.'], "_");
+        // Ensure fetch is in progress (non-blocking spawn).
+        self.ensure_metadata_fetching(&normalized, version);
+        // Block the solver thread on the Notify until data arrives.
+        let result = self.index.wait_metadata(&normalized, version);
+        Ok(result.full_metadata.clone())
+    }
+
+    fn index_url(&self) -> Option<&str> {
+        Some(&self.index_url)
+    }
+
+    fn prefetch(&self, packages: &[String]) {
+        let to_fetch: Vec<String> = packages
+            .iter()
+            .map(|p| p.to_lowercase().replace(['-', '.'], "_"))
+            .collect();
+
+        if !to_fetch.is_empty() {
+            self.fire_prefetch(&to_fetch);
+        }
+    }
+
+    fn prefetch_metadata(&self, package: &str, versions: &[VypVersion]) {
+        let normalized = package.to_lowercase().replace(['-', '.'], "_");
+
+        for version in versions {
+            // Atomically claim. Skip if someone else is already fetching.
+            if !self.index.register_metadata(&normalized, version) {
+                continue;
+            }
+
+            let has_metadata = self.index
+                .get_wheel_info(&normalized, version)
+                .map(|wheels| wheels.iter().any(|w| w.has_metadata))
+                .unwrap_or(false);
+
+            if !has_metadata {
+                self.index.set_metadata(&normalized, version, MetadataResult {
+                    dependencies: Vec::new(),
+                    full_metadata: None,
+                });
+                continue;
+            }
+
+            let client = self.client.clone();
+            let idx = Arc::clone(&self.index);
+            let cache = Arc::clone(&self.disk_cache);
+            let env = self.marker_env.clone();
+            let sem = Arc::clone(&self.semaphore);
+            let pkg = normalized.clone();
+            let ver = version.clone();
+
+            self.runtime.as_ref().expect("runtime dropped").spawn(async move {
+                if let Some(cached_meta) = cache.lock().expect("poisoned").get(&pkg, &ver) {
+                    idx.set_metadata(&pkg, &ver, MetadataResult {
+                        dependencies: cached_meta.dependencies.clone(),
+                        full_metadata: Some(cached_meta),
+                    });
+                    return;
+                }
+                let wheel_url = idx
+                    .get_wheel_info(&pkg, &ver)
+                    .and_then(|wheels| wheels.iter().find(|w| w.has_metadata).map(|w| w.url.clone()));
+
+                if let Some(wheel_url) = wheel_url {
+                    let metadata_url = format!("{}.metadata", wheel_url);
+                    if let Ok(meta) = fetch_metadata_async(
+                        &client, &metadata_url, &pkg, &ver, &env, &sem,
+                    ).await {
+                        cache.lock().expect("poisoned").insert(&pkg, &ver, &meta);
+                        let deps = meta.dependencies.clone();
+                        idx.set_metadata(&pkg, &ver, MetadataResult {
+                            dependencies: deps,
+                            full_metadata: Some(meta),
+                        });
+                        return;
+                    }
+                }
+
+                idx.set_metadata(&pkg, &ver, MetadataResult {
+                    dependencies: Vec::new(),
+                    full_metadata: None,
+                });
+            });
+        }
+    }
+
+    fn try_available_versions(
+        &self,
+        package: &VypPackage,
+    ) -> Option<PackageVersions> {
+        let normalized = package.name().to_lowercase().replace(['-', '.'], "_");
+        let result = self.index.try_get_versions(&normalized)?;
+        if result.versions.is_empty() {
+            None
+        } else {
+            Some(PackageVersions {
+                package: package.clone(),
+                versions: result.versions.clone(),
+            })
+        }
+    }
+
+    fn wheel_url(
+        &self,
+        package: &str,
+        version: &VypVersion,
+    ) -> Option<(String, String)> {
+        let normalized = package.to_lowercase().replace(['-', '.'], "_");
+        let wheels = self.index.get_wheel_info(&normalized, version)?;
+        let tags = PlatformTags::from_env(&self.marker_env);
+
+        let mut best: Option<(u32, &WheelInfo)> = None;
+        for w in &wheels {
+            if !w.filename.ends_with(".whl") {
+                continue;
+            }
+            if !tags.is_compatible(&w.filename) {
+                continue;
+            }
+            let score = tags.compatibility_score(&w.filename);
+            if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                best = Some((score, w));
+            }
+        }
+
+        best.map(|(_, w)| (w.filename.clone(), w.url.clone()))
+    }
+
+    fn profile_data(&self) -> HashMap<String, usize> {
+        let c = self.profile_counters.lock().expect("poisoned");
+        let mut m = HashMap::new();
+        m.insert("version_disk_hits".into(), c.version_disk_hits);
+        m.insert("version_304s".into(), c.version_304s);
+        m.insert("version_fresh_fetches".into(), c.version_fresh_fetches);
+        m.insert("metadata_disk_hits".into(), c.metadata_disk_hits);
+        m.insert("metadata_network_fetches".into(), c.metadata_network_fetches);
+        m
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filename parsing utilities
+// ---------------------------------------------------------------------------
+
+pub fn extract_version_from_filename(filename: &str) -> Option<VypVersion> {
+    let name = filename
+        .strip_suffix(".whl")
+        .or_else(|| filename.strip_suffix(".tar.gz"))
+        .or_else(|| filename.strip_suffix(".zip"))
+        .unwrap_or(filename);
+
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() >= 2 {
+        if let Ok(v) = parts[1].parse::<VypVersion>() {
+            return Some(v);
+        }
+    }
+
+    None
+}
+
+#[derive(Debug, Clone)]
+pub struct WheelFilename {
+    pub distribution: String,
+    pub version: String,
+    pub build_tag: Option<String>,
+    pub python_tag: String,
+    pub abi_tag: String,
+    pub platform_tag: String,
+    pub variant_label: Option<String>,
+}
+
+impl WheelFilename {
+    pub fn parse(filename: &str) -> Option<Self> {
+        let stem = filename.strip_suffix(".whl")?;
+        let parts: Vec<&str> = stem.split('-').collect();
+
+        match parts.len() {
+            5 => Some(WheelFilename {
+                distribution: parts[0].to_string(),
+                version: parts[1].to_string(),
+                build_tag: None,
+                python_tag: parts[2].to_string(),
+                abi_tag: parts[3].to_string(),
+                platform_tag: parts[4].to_string(),
+                variant_label: None,
+            }),
+            6 => {
+                if parts[2].starts_with(|c: char| c.is_ascii_digit()) {
+                    Some(WheelFilename {
+                        distribution: parts[0].to_string(),
+                        version: parts[1].to_string(),
+                        build_tag: Some(parts[2].to_string()),
+                        python_tag: parts[3].to_string(),
+                        abi_tag: parts[4].to_string(),
+                        platform_tag: parts[5].to_string(),
+                        variant_label: None,
+                    })
+                } else {
+                    Some(WheelFilename {
+                        distribution: parts[0].to_string(),
+                        version: parts[1].to_string(),
+                        build_tag: None,
+                        python_tag: parts[2].to_string(),
+                        abi_tag: parts[3].to_string(),
+                        platform_tag: parts[4].to_string(),
+                        variant_label: Some(parts[5].to_string()),
+                    })
+                }
+            }
+            7 => Some(WheelFilename {
+                distribution: parts[0].to_string(),
+                version: parts[1].to_string(),
+                build_tag: Some(parts[2].to_string()),
+                python_tag: parts[3].to_string(),
+                abi_tag: parts[4].to_string(),
+                platform_tag: parts[5].to_string(),
+                variant_label: Some(parts[6].to_string()),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_thread_runtime_reqwest() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let client = reqwest::Client::builder()
+            .user_agent("vyp-test/0.1")
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let body = rt.block_on(async {
+            let resp = client
+                .get("https://pypi.org/simple/requests/")
+                .header("Accept", "application/vnd.pypi.simple.v1+json")
+                .send()
+                .await
+                .expect("send failed");
+            resp.text().await.expect("body failed")
+        });
+        assert!(body.len() > 100, "got {} bytes", body.len());
+    }
+
+    #[test]
+    fn test_provider_fetch_versions() {
+        let provider = PyPIMetadataProvider::new("https://pypi.org/simple");
+        let pkg = VypPackage::named("requests");
+        let result = provider.available_versions(&pkg).unwrap();
+        assert!(result.is_some(), "expected versions for requests");
+        let pv = result.unwrap();
+        assert!(!pv.versions.is_empty(), "expected non-empty versions");
+        eprintln!("got {} versions for requests", pv.versions.len());
+    }
+
+    #[test]
+    fn test_extract_version_from_wheel() {
+        let v = extract_version_from_filename("numpy-1.26.4-cp312-cp312-macosx_11_0_arm64.whl");
+        assert_eq!(v, Some(VypVersion::from_parts(1, 26, 4)));
+    }
+
+    #[test]
+    fn test_extract_version_from_sdist() {
+        let v = extract_version_from_filename("requests-2.31.0.tar.gz");
+        assert_eq!(v, Some(VypVersion::from_parts(2, 31, 0)));
+    }
+
+    #[test]
+    fn test_wheel_filename_parse_standard() {
+        let wf =
+            WheelFilename::parse("numpy-2.3.2-cp313-cp313t-musllinux_1_2_x86_64.whl").unwrap();
+        assert_eq!(wf.distribution, "numpy");
+        assert_eq!(wf.version, "2.3.2");
+        assert!(wf.build_tag.is_none());
+        assert!(wf.variant_label.is_none());
+    }
+
+    #[test]
+    fn test_wheel_filename_parse_with_variant() {
+        let wf = WheelFilename::parse(
+            "numpy-2.3.2-cp313-cp313t-musllinux_1_2_x86_64-x86_64_v3.whl",
+        )
+        .unwrap();
+        assert_eq!(wf.distribution, "numpy");
+        assert_eq!(wf.variant_label.as_deref(), Some("x86_64_v3"));
+        assert!(wf.build_tag.is_none());
+    }
+
+    #[test]
+    fn test_wheel_filename_parse_with_build_and_variant() {
+        let wf = WheelFilename::parse(
+            "numpy-2.3.2-1-cp313-cp313t-musllinux_1_2_x86_64-x86_64_v3.whl",
+        )
+        .unwrap();
+        assert_eq!(wf.build_tag.as_deref(), Some("1"));
+        assert_eq!(wf.variant_label.as_deref(), Some("x86_64_v3"));
+    }
+
+    #[test]
+    fn test_scope_filter() {
+        use std::sync::Mutex;
+
+        // Minimal in-memory scope: an allow-set guarded by a mutex.
+        #[derive(Debug)]
+        struct SetScope(Mutex<std::collections::HashSet<String>>);
+        impl IndexScope for SetScope {
+            fn allows(&self, package: &str) -> bool {
+                self.0.lock().unwrap().contains(package)
+            }
+        }
+
+        let set: std::collections::HashSet<String> =
+            ["torch".to_string(), "torchvision".to_string()].into_iter().collect();
+        let scope: Arc<dyn IndexScope> = Arc::new(SetScope(Mutex::new(set)));
+        let provider = PyPIMetadataProvider::with_name(
+            "pytorch",
+            "https://download.pytorch.org/whl/cu128",
+            Some(scope),
+        );
+        assert!(provider.matches_filter("torch"));
+        assert!(provider.matches_filter("torchvision"));
+        assert!(!provider.matches_filter("numpy"));
+    }
+
+    #[test]
+    fn test_unscoped_provider_allows_all() {
+        let provider = PyPIMetadataProvider::new("https://pypi.org/simple");
+        assert!(provider.matches_filter("anything"));
+        assert!(provider.matches_filter("torch"));
+    }
+}
