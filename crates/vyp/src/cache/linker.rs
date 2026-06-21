@@ -51,6 +51,15 @@ pub fn install_wheel(
     let data_dir = top_level_dir_with_suffix(&files, ".data");
     let dist_info = top_level_dir_with_suffix(&files, ".dist-info");
 
+    // Reuse the hashes the wheel already published in its own RECORD instead of
+    // re-hashing every installed file — re-hashing would read every byte and
+    // defeat the reflink/hardlink fast path. Only relocated and freshly
+    // generated files (a small handful) are hashed below.
+    let wheel_record: std::collections::HashMap<String, (String, u64)> = dist_info
+        .as_ref()
+        .map(|di| parse_wheel_record(&archive_dir.join(di).join("RECORD")))
+        .unwrap_or_default();
+
     let mut created_dirs: HashSet<PathBuf> = HashSet::new();
     let mut records: Vec<RecordEntry> = Vec::new();
 
@@ -62,7 +71,7 @@ pub fn install_wheel(
 
         // Route the file: a `*.data/<scheme>/...` payload is relocated, all
         // other files land in site-packages.
-        let (target, is_script) = match data_dir
+        let (target, is_script, from_data) = match data_dir
             .as_deref()
             .and_then(|d| rel.strip_prefix(d).ok())
         {
@@ -77,9 +86,9 @@ pub fn install_wheel(
                     continue;
                 }
                 let dest_dir = layout.data_scheme_target(&scheme);
-                (dest_dir.join(&sub), scheme == "scripts")
+                (dest_dir.join(&sub), scheme == "scripts", true)
             }
-            None => (layout.site_packages.join(rel), false),
+            None => (layout.site_packages.join(rel), false, false),
         };
 
         ensure_parent(&target, &mut created_dirs)?;
@@ -90,6 +99,27 @@ pub fn install_wheel(
             place_file(&source, &target, assume_fresh)?;
         }
 
+        // The wheel's own RECORD is regenerated below; don't carry it over.
+        let rel_key = rel.to_string_lossy().replace('\\', "/");
+        if dist_info.as_ref().is_some_and(|di| {
+            rel_key == format!("{}/RECORD", di.to_string_lossy())
+        }) {
+            continue;
+        }
+
+        if !from_data {
+            // Verbatim wheel file: reuse the published hash/size (no I/O).
+            if let Some((hash, size)) = wheel_record.get(&rel_key) {
+                records.push(RecordEntry {
+                    rel: rel_key,
+                    hash: hash.clone(),
+                    size: *size,
+                });
+                continue;
+            }
+        }
+        // Relocated payload, rewritten script, or a file the wheel RECORD
+        // didn't list — hash it directly.
         if let Some(entry) = record_entry(layout, &target)? {
             records.push(entry);
         }
@@ -356,6 +386,31 @@ fn record_entry(
     let hash = format!("sha256={}", base64_urlsafe_nopad(&digest));
     let rel = relative_to(&layout.site_packages, target);
     Ok(Some(RecordEntry { rel, hash, size: meta.len() }))
+}
+
+/// Parse a wheel's bundled `RECORD` into `path -> (hash, size)`, so installed
+/// files can reuse the published digests instead of being re-hashed. Entries
+/// with no hash or size (e.g. the wheel's own RECORD line) are skipped.
+fn parse_wheel_record(record_path: &Path) -> std::collections::HashMap<String, (String, u64)> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(content) = std::fs::read_to_string(record_path) else {
+        return map;
+    };
+    for line in content.lines() {
+        // RECORD is CSV: path,hash,size. Paths may be quoted if they contain
+        // commas; wheel paths almost never are, so split from the right on the
+        // last two commas to isolate hash and size.
+        let line = line.trim_end_matches(['\r', '\n']);
+        let Some((rest, size)) = line.rsplit_once(',') else { continue };
+        let Some((path, hash)) = rest.rsplit_once(',') else { continue };
+        if hash.is_empty() || size.is_empty() {
+            continue;
+        }
+        let Ok(size) = size.parse::<u64>() else { continue };
+        let path = path.trim_matches('"').to_string();
+        map.insert(path, (hash.to_string(), size));
+    }
+    map
 }
 
 /// Write the `.dist-info/RECORD` manifest (RECORD lists itself with no hash).
