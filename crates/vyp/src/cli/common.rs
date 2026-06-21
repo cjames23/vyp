@@ -1,4 +1,3 @@
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering as AtomicOrdering};
@@ -12,6 +11,7 @@ use rayon::prelude::*;
 
 use crate::cache::wheel_cache::WheelCache;
 use crate::cache::linker;
+use crate::cache::venv::VenvLayout;
 use crate::config::settings::VypConfig;
 use crate::lock::lockfile::{LockFile, PyLockPackage};
 use crate::lock::universal::{merge_universal_results, parse_python_version_from_marker, UniversalPackageEntry};
@@ -251,7 +251,8 @@ pub fn install_lockfile(
     }
 
     let t_site_start = Instant::now();
-    let site_packages = resolve_site_packages(venv)?;
+    let layout = VenvLayout::discover(venv)?;
+    let site_packages = layout.site_packages.clone();
     let site_packages_ms = if profiling { t_site_start.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
     let fallback_index = default_index.unwrap_or(DEFAULT_INDEX);
 
@@ -356,12 +357,12 @@ pub fn install_lockfile(
     // Run cached link + streaming download→extract→link concurrently.
     let t_pipeline_start = Instant::now();
     let (link_cached_results, download_pipeline_results) = rt.block_on(async {
-        let sp = site_packages.clone();
         let lnk_c = Arc::clone(&lnk_ns);
         let cached_link_wall = Arc::clone(&cached_link_wall_ns);
         let assume_fresh = assume_fresh;
         let install_workers = install_workers;
 
+        let layout_cached = layout.clone();
         let cache_link_handle = tokio::task::spawn_blocking(move || {
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
@@ -374,7 +375,7 @@ pub fn install_lockfile(
                     .map(|(name, archive_path, file_list)| {
                         let t = Instant::now();
                         let list_ref = file_list.as_deref();
-                        let res = linker::install_from_archive(archive_path, &sp, list_ref, assume_fresh)
+                        let res = linker::install_wheel(archive_path, &layout_cached, list_ref, assume_fresh, false)
                             .map_err(|e| (name.clone(), format!("install failed: {}", e)));
                         lnk_c.fetch_add(t.elapsed().as_nanos() as usize, AtomicOrdering::Relaxed);
                         res
@@ -394,7 +395,7 @@ pub fn install_lockfile(
                     let cl = client.clone();
                     let fb = fallback_index.to_string();
                     let tmp = tmp_dir.clone();
-                    let sp2 = site_packages.clone();
+                    let layout2 = layout.clone();
                     let tags = tags_owned.clone();
                     let dl_c = Arc::clone(&dl_ns);
                     let ext_c = Arc::clone(&ext_ns);
@@ -414,6 +415,7 @@ pub fn install_lockfile(
                             .cloned();
                         let cache_key = format!("{}-{}", job.name.to_lowercase().replace('-', "_"), job.version);
                         let pkg_name = job.name;
+                        let job_version = job.version;
 
                         tokio::task::spawn_blocking(move || {
                             dl_c.fetch_add(dl_elapsed, AtomicOrdering::Relaxed);
@@ -436,9 +438,18 @@ pub fn install_lockfile(
                             let _ = std::fs::remove_file(&dw.path);
                             ext_c.fetch_add(ext_start.elapsed().as_nanos() as usize, AtomicOrdering::Relaxed);
 
+                            // With no published hash to pin, fall back to a
+                            // name/version identity check against the wheel's
+                            // own METADATA (guards against index confusion).
+                            if expected_hash.is_none() {
+                                if let Err(e) = linker::verify_wheel_identity(&archive_path, &pkg_name, &job_version) {
+                                    return Err((pkg_name, e.to_string()));
+                                }
+                            }
+
                             let link_start = Instant::now();
                             let file_list_ref = if file_list.is_empty() { None } else { Some(file_list.as_slice()) };
-                            if let Err(e) = linker::install_from_archive(&archive_path, &sp2, file_list_ref, assume_fresh_dl) {
+                            if let Err(e) = linker::install_wheel(&archive_path, &layout2, file_list_ref, assume_fresh_dl, false) {
                                 return Err((pkg_name, format!("install failed: {}", e)));
                             }
                             lnk_c.fetch_add(link_start.elapsed().as_nanos() as usize, AtomicOrdering::Relaxed);
@@ -559,7 +570,10 @@ async fn download_wheel_job(
         }
     };
 
-    let response = client.get(&url).send().await?.error_for_status()?;
+    let response = vyp_index::auth::apply_auth(client.get(&url), &url)
+        .send()
+        .await?
+        .error_for_status()?;
 
     let tmp_path = tmp_dir.join(format!(
         "{}-{}.whl.tmp",
@@ -602,12 +616,15 @@ async fn resolve_wheel_url_direct(
         normalized_name.replace('_', "-")
     );
 
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.pypi.simple.v1+json")
-        .send()
-        .await?
-        .error_for_status()?;
+    let response = vyp_index::auth::apply_auth(
+        client
+            .get(&url)
+            .header("Accept", "application/vnd.pypi.simple.v1+json"),
+        &url,
+    )
+    .send()
+    .await?
+    .error_for_status()?;
 
     let body = response.text().await?;
 
@@ -616,57 +633,6 @@ async fn resolve_wheel_url_direct(
     } else {
         find_wheel_url_html(&body, version, tags)
     }
-}
-
-pub fn resolve_site_packages(venv: Option<&Path>) -> miette::Result<PathBuf> {
-    if let Some(venv_path) = venv {
-        return find_site_packages_in_venv(venv_path);
-    }
-
-    if let Ok(virtual_env) = std::env::var("VIRTUAL_ENV") {
-        let venv_path = PathBuf::from(&virtual_env);
-        return find_site_packages_in_venv(&venv_path);
-    }
-
-    let local_venv = PathBuf::from(".venv");
-    if local_venv.exists() {
-        return find_site_packages_in_venv(&local_venv);
-    }
-
-    Err(miette::miette!(
-        "No virtual environment found. Use --venv to specify one, \
-         activate one, or create .venv in the current directory."
-    ))
-}
-
-fn find_site_packages_in_venv(venv: &Path) -> miette::Result<PathBuf> {
-    let lib_dir = venv.join("lib");
-    if !lib_dir.exists() {
-        return Err(miette::miette!(
-            "Invalid virtual environment: {} has no lib/ directory",
-            venv.display()
-        ));
-    }
-
-    let entries: Vec<_> = std::fs::read_dir(&lib_dir)
-        .map_err(|e| miette::miette!("Cannot read {}: {}", lib_dir.display(), e))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("python"))
-        .collect();
-
-    let python_dir = entries.first().ok_or_else(|| {
-        miette::miette!("No python directory found in {}", lib_dir.display())
-    })?;
-
-    let site = python_dir.path().join("site-packages");
-    if !site.exists() {
-        return Err(miette::miette!(
-            "site-packages not found at {}",
-            site.display()
-        ));
-    }
-
-    Ok(site)
 }
 
 fn find_wheel_url_json(
@@ -737,116 +703,3 @@ fn find_wheel_url_html(
         .ok_or_else(|| format!("No compatible wheel found for version {} in HTML index", version).into())
 }
 
-#[allow(dead_code)]
-fn verify_wheel_integrity(
-    bytes: &[u8],
-    pkg: &PyLockPackage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(wheel) = pkg.wheels.first() {
-        if let Some(ref hashes) = wheel.hashes {
-            if let Some(expected_sha256) = hashes.get("sha256") {
-                let mut hasher = Sha256::new();
-                hasher.update(bytes);
-                let actual = format!("{:x}", hasher.finalize());
-                if actual != *expected_sha256 {
-                    return Err(format!(
-                        "Hash mismatch for {}: expected sha256={}, got {}",
-                        pkg.name, expected_sha256, actual
-                    ).into());
-                }
-            }
-        }
-    }
-
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)?;
-
-    let metadata_path = (0..archive.len())
-        .find_map(|i| {
-            let file = archive.by_index(i).ok()?;
-            let name = file.name().to_string();
-            if name.ends_with(".dist-info/METADATA") {
-                Some(name)
-            } else {
-                None
-            }
-        });
-
-    if let Some(path) = metadata_path {
-        let mut file = archive.by_name(&path)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
-
-        let mut meta_name = None;
-        let mut meta_version = None;
-        for line in content.lines() {
-            if let Some(val) = line.strip_prefix("Name: ") {
-                meta_name = Some(val.trim().to_string());
-            } else if let Some(val) = line.strip_prefix("Version: ") {
-                meta_version = Some(val.trim().to_string());
-            }
-            if meta_name.is_some() && meta_version.is_some() {
-                break;
-            }
-            if line.is_empty() {
-                break;
-            }
-        }
-
-        if let Some(ref name) = meta_name {
-            let normalized_meta = name.to_lowercase().replace(['-', '.'], "_");
-            let normalized_expected = pkg.name.to_lowercase().replace(['-', '.'], "_");
-            if normalized_meta != normalized_expected {
-                return Err(format!(
-                    "Package name mismatch: lock expects '{}' but wheel contains '{}'",
-                    pkg.name, name
-                ).into());
-            }
-        }
-
-        if let Some(ref version) = meta_version {
-            if *version != pkg.version {
-                return Err(format!(
-                    "Version mismatch for {}: lock expects '{}' but wheel contains '{}'",
-                    pkg.name, pkg.version, version
-                ).into());
-            }
-        }
-    }
-
-    if let Some(ref expected_variant) = pkg.variant {
-        let variant_path = (0..archive.len())
-            .find_map(|i| {
-                let file = archive.by_index(i).ok()?;
-                let name = file.name().to_string();
-                if name.ends_with(".dist-info/variant.json") {
-                    Some(name)
-                } else {
-                    None
-                }
-            });
-
-        if let Some(path) = variant_path {
-            let mut file = archive.by_name(&path)?;
-            let mut content = String::new();
-            file.read_to_string(&mut content)?;
-
-            let actual_variant: vyp_api::VariantDescriptor = serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse variant.json in wheel: {}", e))?;
-
-            if actual_variant != *expected_variant {
-                return Err(format!(
-                    "Variant mismatch for {}: lock variant descriptor does not match wheel's variant.json",
-                    pkg.name
-                ).into());
-            }
-        } else {
-            return Err(format!(
-                "Lock expects variant info for {} but wheel has no variant.json",
-                pkg.name
-            ).into());
-        }
-    }
-
-    Ok(())
-}

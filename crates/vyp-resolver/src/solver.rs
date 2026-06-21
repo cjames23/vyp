@@ -486,6 +486,10 @@ pub struct SatisfierInfo {
 // VSIDS scoring
 // ---------------------------------------------------------------------------
 
+/// When any VSIDS score (or the bump increment) exceeds this, all scores are
+/// rescaled down. Matches the standard SAT-solver activity-rescale guard.
+const VSIDS_RESCALE_THRESHOLD: f64 = 1e100;
+
 pub struct VsidsScoring {
     scores: HashMap<PackageId, f64>,
     bump_increment: f64,
@@ -508,11 +512,34 @@ impl VsidsScoring {
     }
 
     pub fn bump(&mut self, pkg: PackageId) {
-        *self.scores.entry(pkg).or_default() += self.bump_increment;
+        let score = self.scores.entry(pkg).or_default();
+        *score += self.bump_increment;
+        // Rescale all scores down if any grows too large, so neither the scores
+        // nor the (geometrically growing) bump increment can overflow to `inf`
+        // on pathologically long resolves. This preserves relative ordering.
+        if *score > VSIDS_RESCALE_THRESHOLD {
+            self.rescale();
+        }
     }
 
     pub fn decay(&mut self) {
         self.bump_increment /= self.decay_factor;
+        if self.bump_increment > VSIDS_RESCALE_THRESHOLD {
+            self.rescale();
+        }
+    }
+
+    /// Divide every score and the bump increment by the rescale threshold,
+    /// keeping all values finite while preserving their relative order.
+    fn rescale(&mut self) {
+        let inv = 1.0 / VSIDS_RESCALE_THRESHOLD;
+        for v in self.scores.values_mut() {
+            *v *= inv;
+        }
+        self.bump_increment *= inv;
+        if self.bump_increment == 0.0 {
+            self.bump_increment = 1.0;
+        }
     }
 
     pub fn score(&self, pkg: PackageId) -> f64 {

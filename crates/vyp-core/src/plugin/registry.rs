@@ -91,6 +91,21 @@ impl ProviderRegistry {
         None
     }
 
+    /// Return the best wheel distribution (with integrity hashes) for a
+    /// resolved package+version.
+    pub fn wheel_dist(
+        &self,
+        package: &str,
+        version: &vyp_api::VypVersion,
+    ) -> Option<vyp_api::WheelDist> {
+        for provider in &self.providers {
+            if let Some(dist) = provider.wheel_dist(package, version) {
+                return Some(dist);
+            }
+        }
+        None
+    }
+
     /// Collect profile data from all providers (merges counters).
     pub fn collect_profile_data(&self) -> std::collections::HashMap<String, usize> {
         let mut merged = std::collections::HashMap::new();

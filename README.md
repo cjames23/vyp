@@ -17,7 +17,11 @@ vyp solves dependency resolution for Python projects with features not found in 
 - **Package Substitution** — Declare interchangeable packages (e.g., `opencv-python` and `opencv-python-headless`)
 - **Dependency Provenance** — Full causal chain explaining why each version was selected
 - **Unified Dependency Overrides** — Range constraints and exact pins in a single `[[tool.vyp.overrides]]` array, with optional transitive propagation
-- **PEP 751 Lock Files** — Standards-compliant `pylock.toml` output
+- **PEP 751 Lock Files** — Standards-compliant `pylock.toml` output, with pinned wheel integrity hashes
+- **Platform-aware Resolution** — Versions with no installable wheel for the target environment are filtered out (libc-aware manylinux/musllinux tags, current-macOS deployment targets, free-threaded ABIs), so the resolver backtracks to an installable version instead of locking an unusable one
+- **`Requires-Python` & Yank Enforcement** — Versions are excluded when their distributions don't match the target Python (PEP 440) or are yanked (PEP 592)
+- **Spec-compliant Installs** — Entry-point launchers, `*.data/` scheme relocation, shebang rewriting, and `RECORD`/`INSTALLER` generation, plus `uninstall` and `sync`
+- **Private Index Auth** — `~/.netrc` credentials applied to index and download requests
 - **Resolution Explain & Diff** — Trace version selections and compare lock files
 - **Space-efficient Cache** — Content-addressed metadata cache with LRU eviction
 
@@ -129,6 +133,22 @@ vyp lock
 vyp install                     # installs into the active or local .venv
 vyp install --venv .venv        # install into a specific venv
 vyp install --dry-run           # preview what would be installed
+```
+
+Installs are spec-compliant: `console_scripts`/`gui_scripts` entry points are
+turned into executable launchers in the venv's `bin/`, a wheel's
+`*.data/{scripts,data,headers,purelib,platlib}` payloads are relocated to the
+correct scheme directories, `#!python` shebangs are rewritten to the venv
+interpreter, and each distribution gets an `INSTALLER` and a PEP 376 `RECORD`
+so installs are introspectable and uninstallable.
+
+### Uninstall / sync
+
+```bash
+vyp uninstall rich pygments      # remove packages (RECORD-based, removes scripts too)
+vyp sync                         # make the venv exactly match the lock (install + prune extras)
+vyp sync --lockfile pylock.toml  # sync from an explicit lock
+vyp sync --dry-run               # preview adds/removals
 ```
 
 ### Explain a package selection

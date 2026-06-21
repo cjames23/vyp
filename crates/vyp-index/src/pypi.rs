@@ -12,6 +12,21 @@ use crate::wheel_metadata::fetch_wheel_metadata;
 
 const MAX_CONCURRENT_FETCHES: usize = 500;
 
+/// Number of retries for transient index fetch failures (network errors,
+/// 429, and 5xx responses) before surfacing the error to the resolver.
+const MAX_FETCH_RETRIES: u32 = 3;
+
+/// Whether an HTTP status warrants a retry (rate-limit or server error).
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Exponential backoff with a small base, capped, for fetch retries.
+async fn backoff(attempt: u32) {
+    let base_ms = 100u64 << attempt.min(4); // 100, 200, 400, 800, 1600
+    tokio::time::sleep(Duration::from_millis(base_ms.min(2000))).await;
+}
+
 /// Counters for profiling cache/network behaviour during resolution.
 #[derive(Debug, Default)]
 pub struct ProfileCounters {
@@ -37,19 +52,33 @@ pub struct PyPIMetadataProvider {
     scope: Option<Arc<dyn IndexScope>>,
     index: Arc<InMemoryIndex>,
     client: reqwest::Client,
-    runtime: Option<tokio::runtime::Runtime>,
+    /// Async runtime driving all HTTP I/O. Shared process-wide so that
+    /// multiple providers (e.g. PyPI plus scoped accelerator indexes) reuse a
+    /// single worker pool instead of each spawning `num_cpus` threads.
+    runtime: Arc<tokio::runtime::Runtime>,
     disk_cache: Arc<Mutex<crate::cache::MetadataCache>>,
     marker_env: MarkerEnvironment,
     semaphore: Arc<Semaphore>,
     profile_counters: Arc<Mutex<ProfileCounters>>,
 }
 
-impl Drop for PyPIMetadataProvider {
-    fn drop(&mut self) {
-        if let Some(rt) = self.runtime.take() {
-            rt.shutdown_timeout(Duration::from_secs(2));
-        }
-    }
+/// The process-shared multi-threaded async runtime used by every provider.
+fn shared_runtime() -> Arc<tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<Arc<tokio::runtime::Runtime>> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let num_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8);
+            Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(num_workers)
+                    .enable_all()
+                    .build()
+                    .expect("failed to build shared tokio runtime"),
+            )
+        })
+        .clone()
 }
 
 impl std::fmt::Debug for PyPIMetadataProvider {
@@ -100,22 +129,13 @@ impl PyPIMetadataProvider {
 
         let client = shared_client.unwrap_or_else(Self::build_default_client);
 
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(num_workers)
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime");
-
         Self {
             provider_name: name.to_string(),
             index_url: index_url_owned,
             scope,
             index,
             client,
-            runtime: Some(runtime),
+            runtime: shared_runtime(),
             disk_cache,
             marker_env,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)),
@@ -190,7 +210,7 @@ impl PyPIMetadataProvider {
         let counters = Arc::clone(&self.profile_counters);
         let pkg = normalized.to_string();
 
-        self.runtime.as_ref().expect("runtime dropped").spawn(async move {
+        self.runtime.spawn(async move {
             // Disk cache fast path (brief lock, no I/O, never held across .await).
             {
                 let cache = disk_cache.lock().expect("poisoned");
@@ -205,6 +225,7 @@ impl PyPIMetadataProvider {
                     index.set_versions(&pkg, VersionsResult {
                         versions,
                         wheel_info,
+                        fetch_error: None,
                     });
                     return;
                 }
@@ -229,6 +250,7 @@ impl PyPIMetadataProvider {
                         index.set_versions(&pkg, VersionsResult {
                             versions,
                             wheel_info,
+                            fetch_error: None,
                         });
                         let cache = Arc::clone(&disk_cache);
                         let p = pkg.clone();
@@ -248,10 +270,10 @@ impl PyPIMetadataProvider {
                     }
                     Err(e) => {
                         tracing::debug!("conditional fetch failed for {}: {}", pkg, e);
-                        index.set_versions(&pkg, VersionsResult {
-                            versions: Vec::new(),
-                            wheel_info: HashMap::new(),
-                        });
+                        index.set_versions(&pkg, VersionsResult::error(format!(
+                            "failed to fetch versions for {} from {}: {}",
+                            pkg, index_url, e
+                        )));
                         return;
                     }
                 }
@@ -272,14 +294,15 @@ impl PyPIMetadataProvider {
                     index.set_versions(&pkg, VersionsResult {
                         versions: Vec::new(),
                         wheel_info: HashMap::new(),
+                        fetch_error: None,
                     });
                 }
                 Err(e) => {
                     tracing::debug!("failed to fetch versions for {}: {}", pkg, e);
-                    index.set_versions(&pkg, VersionsResult {
-                        versions: Vec::new(),
-                        wheel_info: HashMap::new(),
-                    });
+                    index.set_versions(&pkg, VersionsResult::error(format!(
+                        "failed to fetch versions for {} from {}: {}",
+                        pkg, index_url, e
+                    )));
                 }
             }
         });
@@ -314,7 +337,7 @@ impl PyPIMetadataProvider {
         let pkg = normalized.to_string();
         let ver = version.clone();
 
-        self.runtime.as_ref().expect("runtime dropped").spawn(async move {
+        self.runtime.spawn(async move {
             let cached = disk_cache.lock().expect("poisoned").get(&pkg, &ver);
 
             if let Some(cached_meta) = cached {
@@ -506,32 +529,67 @@ async fn fetch_versions_async(
 ) -> Result<FetchVersionsOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let _permit = semaphore.acquire().await.expect("semaphore closed");
     let url = format!("{}/{}/", index_url, normalized);
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/vnd.pypi.simple.v1+json");
 
-    if let Some(etag) = cached_etag {
-        req = req.header("If-None-Match", etag);
-    }
-    if let Some(lm) = cached_last_modified {
-        req = req.header("If-Modified-Since", lm);
-    }
+    // Retry transient transport failures and retryable status codes (429/5xx)
+    // with exponential backoff before giving up.
+    let response = {
+        let mut attempt = 0u32;
+        loop {
+            let mut req = client
+                .get(&url)
+                .header("Accept", "application/vnd.pypi.simple.v1+json");
+            req = crate::auth::apply_auth(req, &url);
+            if let Some(etag) = cached_etag {
+                req = req.header("If-None-Match", etag);
+            }
+            if let Some(lm) = cached_last_modified {
+                req = req.header("If-Modified-Since", lm);
+            }
 
-    let response = req.send().await?;
+            match req.send().await {
+                Ok(resp) => {
+                    if is_retryable_status(resp.status()) && attempt < MAX_FETCH_RETRIES {
+                        backoff(attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    break resp;
+                }
+                Err(e) => {
+                    if attempt < MAX_FETCH_RETRIES {
+                        backoff(attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+    };
 
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(FetchVersionsOutcome::NotModified);
     }
 
     if !response.status().is_success() {
-        return Ok(FetchVersionsOutcome::Fresh {
-            result: VersionsResult {
-                versions: Vec::new(),
-                wheel_info: HashMap::new(),
-            },
-            etag: None,
-            last_modified: None,
-        });
+        let status = response.status();
+        // 404/410 mean the package genuinely isn't on this index (empty, no
+        // error — lets scoped indexes fall through). Any other non-success
+        // status is a transport/server failure the resolver should surface.
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::GONE
+        {
+            return Ok(FetchVersionsOutcome::Fresh {
+                result: VersionsResult {
+                    versions: Vec::new(),
+                    wheel_info: HashMap::new(),
+                    fetch_error: None,
+                },
+                etag: None,
+                last_modified: None,
+            });
+        }
+        return Err(format!("index returned HTTP {} for {}", status, url).into());
     }
 
     let etag = response
@@ -560,6 +618,7 @@ async fn fetch_versions_async(
         VersionsResult {
             versions,
             wheel_info: HashMap::new(),
+            fetch_error: None,
         }
     };
 
@@ -596,6 +655,11 @@ async fn parse_json_simple_async(
         core_metadata: Option<serde_json::Value>,
         #[serde(default, rename = "requires-python")]
         requires_python: Option<String>,
+        /// PEP 592: `false`, `true`, or a string reason. Absent means not yanked.
+        #[serde(default)]
+        yanked: serde_json::Value,
+        #[serde(default)]
+        hashes: std::collections::BTreeMap<String, String>,
     }
 
     let bytes = response.bytes().await?;
@@ -646,6 +710,13 @@ async fn parse_json_simple_async(
             })
             .unwrap_or(false);
 
+        // PEP 592: yanked is `true` or a non-empty reason string.
+        let yanked = match &file.yanked {
+            serde_json::Value::Bool(b) => *b,
+            serde_json::Value::String(s) => !s.is_empty(),
+            _ => false,
+        };
+
         if let Some(file_version) = extract_version_from_filename(&file.filename) {
             if json.versions.is_empty() && version_set.insert(file_version.to_string()) {
                 versions.push(file_version.clone());
@@ -659,6 +730,8 @@ async fn parse_json_simple_async(
                     url: file.url,
                     has_metadata,
                     requires_python: file.requires_python,
+                    yanked,
+                    hashes: file.hashes,
                 });
         }
     }
@@ -667,6 +740,7 @@ async fn parse_json_simple_async(
     Ok(VersionsResult {
         versions,
         wheel_info,
+        fetch_error: None,
     })
 }
 
@@ -691,7 +765,9 @@ async fn fetch_metadata_async(
     semaphore: &Semaphore,
 ) -> Result<PackageMetadata, Box<dyn std::error::Error + Send + Sync>> {
     let _permit = semaphore.acquire().await.expect("semaphore closed");
-    let response = client.get(metadata_url).send().await?;
+    let response = crate::auth::apply_auth(client.get(metadata_url), metadata_url)
+        .send()
+        .await?;
     if !response.status().is_success() {
         return Err(format!("metadata fetch failed: {}", response.status()).into());
     }
@@ -855,12 +931,20 @@ impl MetadataProvider for PyPIMetadataProvider {
         // Block the solver thread on the Notify until data arrives.
         let result = self.index.wait_versions(&normalized);
 
-        if result.versions.is_empty() {
+        let mut versions = result.versions.clone();
+        crate::version_filter::filter_versions(&mut versions, &result.wheel_info, &self.marker_env);
+
+        if versions.is_empty() {
+            // Distinguish a real transport failure from "no such package": only
+            // the former should abort resolution with an error.
+            if let Some(err) = &result.fetch_error {
+                return Err(err.clone().into());
+            }
             Ok(None)
         } else {
             Ok(Some(PackageVersions {
                 package: package.clone(),
-                versions: result.versions.clone(),
+                versions,
             }))
         }
     }
@@ -923,7 +1007,7 @@ impl MetadataProvider for PyPIMetadataProvider {
             let pkg = normalized.clone();
             let ver = version.clone();
 
-            self.runtime.as_ref().expect("runtime dropped").spawn(async move {
+            self.runtime.spawn(async move {
                 if let Some(cached_meta) = cache.lock().expect("poisoned").get(&pkg, &ver) {
                     idx.set_metadata(&pkg, &ver, MetadataResult {
                         dependencies: cached_meta.dependencies.clone(),
@@ -964,12 +1048,14 @@ impl MetadataProvider for PyPIMetadataProvider {
     ) -> Option<PackageVersions> {
         let normalized = package.name().to_lowercase().replace(['-', '.'], "_");
         let result = self.index.try_get_versions(&normalized)?;
-        if result.versions.is_empty() {
+        let mut versions = result.versions.clone();
+        crate::version_filter::filter_versions(&mut versions, &result.wheel_info, &self.marker_env);
+        if versions.is_empty() {
             None
         } else {
             Some(PackageVersions {
                 package: package.clone(),
-                versions: result.versions.clone(),
+                versions,
             })
         }
     }
@@ -979,13 +1065,21 @@ impl MetadataProvider for PyPIMetadataProvider {
         package: &str,
         version: &VypVersion,
     ) -> Option<(String, String)> {
+        self.wheel_dist(package, version).map(|d| (d.filename, d.url))
+    }
+
+    fn wheel_dist(
+        &self,
+        package: &str,
+        version: &VypVersion,
+    ) -> Option<vyp_api::WheelDist> {
         let normalized = package.to_lowercase().replace(['-', '.'], "_");
         let wheels = self.index.get_wheel_info(&normalized, version)?;
         let tags = PlatformTags::from_env(&self.marker_env);
 
         let mut best: Option<(u32, &WheelInfo)> = None;
         for w in &wheels {
-            if !w.filename.ends_with(".whl") {
+            if !w.filename.ends_with(".whl") || w.yanked {
                 continue;
             }
             if !tags.is_compatible(&w.filename) {
@@ -997,7 +1091,12 @@ impl MetadataProvider for PyPIMetadataProvider {
             }
         }
 
-        best.map(|(_, w)| (w.filename.clone(), w.url.clone()))
+        best.map(|(_, w)| vyp_api::WheelDist {
+            filename: w.filename.clone(),
+            url: w.url.clone(),
+            hashes: w.hashes.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            size: None,
+        })
     }
 
     fn profile_data(&self) -> HashMap<String, usize> {

@@ -7,7 +7,7 @@ pub use traits::conflict_strategy::{
     ConflictContext, ConflictStrategy, ConflictSuggestion, ForkSpec, RangeRewrite, StrategyVerdict,
 };
 pub use traits::index_scope::IndexScope;
-pub use traits::metadata_provider::{MetadataProvider, PackageMetadata, PackageVersions};
+pub use traits::metadata_provider::{MetadataProvider, PackageMetadata, PackageVersions, WheelDist};
 pub use traits::resolution_filter::{Candidate, ResolutionFilter};
 pub use types::conflict::{ConflictDeclaration, ConflictSet};
 pub use types::override_layer::DependencyOverride;

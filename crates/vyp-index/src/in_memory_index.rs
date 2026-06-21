@@ -17,11 +17,26 @@ pub struct InMemoryIndex {
 }
 
 /// Result of fetching versions, including PEP 658 file info.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct VersionsResult {
     pub versions: Vec<VypVersion>,
     /// Wheel files per version with PEP 658 metadata availability.
     pub wheel_info: HashMap<VypVersion, Vec<WheelInfo>>,
+    /// Set when the version list could not be fetched due to a transport/HTTP
+    /// error (as opposed to the package genuinely having no versions). Lets the
+    /// resolver distinguish "network failure" from "no such package".
+    pub fetch_error: Option<String>,
+}
+
+impl VersionsResult {
+    /// An empty result carrying a network/transport error reason.
+    pub fn error(reason: impl Into<String>) -> Self {
+        Self {
+            versions: Vec::new(),
+            wheel_info: HashMap::new(),
+            fetch_error: Some(reason.into()),
+        }
+    }
 }
 
 /// Information about a wheel file from the Simple API response.
@@ -31,6 +46,12 @@ pub struct WheelInfo {
     pub url: String,
     pub has_metadata: bool,
     pub requires_python: Option<String>,
+    /// PEP 592 yank status: `true` if the file is yanked.
+    #[serde(default)]
+    pub yanked: bool,
+    /// Integrity hashes published by the index (algo -> hex digest).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub hashes: std::collections::BTreeMap<String, String>,
 }
 
 /// Metadata result stored in the index.

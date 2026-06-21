@@ -1,85 +1,549 @@
-use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
-/// Install files from a pre-extracted archive directory into site-packages.
-/// Tries reflink (CoW clone) first, then hardlink, then copy as fallback.
+use sha2::{Digest, Sha256};
+
+use crate::cache::venv::VenvLayout;
+
+/// One installed-file record for the `.dist-info/RECORD` manifest.
+struct RecordEntry {
+    /// Path of the installed file relative to site-packages (forward slashes),
+    /// e.g. `requests/__init__.py` or `../../../bin/normalizer`.
+    rel: String,
+    /// `sha256=<urlsafe-b64-nopad>` digest, or empty for the RECORD file itself.
+    hash: String,
+    size: u64,
+}
+
+/// Install a pre-extracted wheel archive into a virtual environment.
 ///
-/// When `file_list` is provided, iterates it directly instead of calling
-/// walkdir — this skips the filesystem traversal entirely.
+/// This goes beyond a verbatim file copy: it relocates the wheel's
+/// `*.data/{scripts,data,headers,purelib,platlib}` payloads to their scheme
+/// directories, generates `console_scripts`/`gui_scripts` launchers from
+/// `entry_points.txt`, rewrites `#!python` shebangs in bundled scripts, and
+/// writes the `INSTALLER` and `RECORD` files so the install is introspectable
+/// and uninstallable.
 ///
-/// When `assume_fresh` is true, skips the per-file exists/remove_file check
-/// (safe when site_packages was empty at install start — we only add files).
+/// `file_list`, when provided, is the archive's relative file list (skips a
+/// filesystem walk). `assume_fresh` skips per-file existence checks when the
+/// target site-packages started empty. `requested` marks the package as a
+/// direct (top-level) request, adding a `REQUESTED` marker per PEP 376.
+pub fn install_wheel(
+    archive_dir: &Path,
+    layout: &VenvLayout,
+    file_list: Option<&[PathBuf]>,
+    assume_fresh: bool,
+    requested: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Resolve the archive's relative file list once.
+    let files: Vec<PathBuf> = match file_list {
+        Some(f) => f.to_vec(),
+        None => walkdir::WalkDir::new(archive_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.path().strip_prefix(archive_dir).ok().map(|p| p.to_path_buf()))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect(),
+    };
+
+    // Identify the top-level `*.data` and `*.dist-info` directory names.
+    let data_dir = top_level_dir_with_suffix(&files, ".data");
+    let dist_info = top_level_dir_with_suffix(&files, ".dist-info");
+
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut records: Vec<RecordEntry> = Vec::new();
+
+    for rel in &files {
+        let source = archive_dir.join(rel);
+        if source.is_dir() {
+            continue;
+        }
+
+        // Route the file: a `*.data/<scheme>/...` payload is relocated, all
+        // other files land in site-packages.
+        let (target, is_script) = match data_dir
+            .as_deref()
+            .and_then(|d| rel.strip_prefix(d).ok())
+        {
+            Some(inner) => {
+                let mut comps = inner.components();
+                let scheme = comps
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let sub: PathBuf = comps.as_path().to_path_buf();
+                if sub.as_os_str().is_empty() {
+                    continue;
+                }
+                let dest_dir = layout.data_scheme_target(&scheme);
+                (dest_dir.join(&sub), scheme == "scripts")
+            }
+            None => (layout.site_packages.join(rel), false),
+        };
+
+        ensure_parent(&target, &mut created_dirs)?;
+
+        if is_script {
+            install_script_file(&source, &target, layout)?;
+        } else {
+            place_file(&source, &target, assume_fresh)?;
+        }
+
+        if let Some(entry) = record_entry(layout, &target)? {
+            records.push(entry);
+        }
+    }
+
+    // Generate entry-point launchers and capture them in RECORD.
+    if let Some(di) = &dist_info {
+        let ep_path = archive_dir.join(di).join("entry_points.txt");
+        if ep_path.exists() {
+            let content = std::fs::read_to_string(&ep_path)?;
+            for script in parse_entry_point_scripts(&content) {
+                let target = generate_launcher(layout, &script)?;
+                if let Some(entry) = record_entry(layout, &target)? {
+                    records.push(entry);
+                }
+            }
+        }
+
+        // Write INSTALLER, REQUESTED, then RECORD (RECORD lists itself last).
+        let dist_info_dir = layout.site_packages.join(di);
+        std::fs::create_dir_all(&dist_info_dir)?;
+
+        let installer = dist_info_dir.join("INSTALLER");
+        std::fs::write(&installer, b"vyp\n")?;
+        if let Some(e) = record_entry(layout, &installer)? {
+            records.push(e);
+        }
+
+        if requested {
+            let req = dist_info_dir.join("REQUESTED");
+            std::fs::write(&req, b"")?;
+            if let Some(e) = record_entry(layout, &req)? {
+                records.push(e);
+            }
+        }
+
+        write_record(layout, di, &mut records)?;
+    }
+
+    Ok(())
+}
+
+/// Backwards-compatible thin copy used where venv layout is unavailable
+/// (kept for the dry-run / legacy path): copies files verbatim into
+/// site-packages without scheme relocation.
+#[allow(dead_code)]
 pub fn install_from_archive(
     archive_dir: &Path,
     site_packages: &Path,
     file_list: Option<&[PathBuf]>,
     assume_fresh: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut created_dirs: HashSet<Box<Path>> = HashSet::new();
-
-    if let Some(files) = file_list {
-        for rel in files {
-            let source = archive_dir.join(rel);
-            let target = site_packages.join(rel);
-
-            if let Some(parent) = target.parent() {
-                if created_dirs.insert(parent.into()) {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
-
-            if source.is_dir() {
-                if created_dirs.insert(target.as_path().into()) {
-                    std::fs::create_dir_all(&target)?;
-                }
-                continue;
-            }
-
-            if !assume_fresh && target.exists() {
-                std::fs::remove_file(&target)?;
-            }
-            if reflink_copy::reflink(&source, &target).is_ok() {
-                continue;
-            }
-            if std::fs::hard_link(&source, &target).is_ok() {
-                continue;
-            }
-            std::fs::copy(&source, &target)?;
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    let walk_owned;
+    let files: &[PathBuf] = match file_list {
+        Some(f) => f,
+        None => {
+            walk_owned = walkdir::WalkDir::new(archive_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.path().strip_prefix(archive_dir).ok().map(|p| p.to_path_buf()))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect::<Vec<_>>();
+            &walk_owned
         }
-    } else {
-        for entry in walkdir::WalkDir::new(archive_dir) {
-            let entry = entry?;
-            let rel = entry.path().strip_prefix(archive_dir)?;
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            let target = site_packages.join(rel);
+    };
+    for rel in files {
+        let source = archive_dir.join(rel);
+        if source.is_dir() {
+            continue;
+        }
+        let target = site_packages.join(rel);
+        ensure_parent(&target, &mut created_dirs)?;
+        place_file(&source, &target, assume_fresh)?;
+    }
+    Ok(())
+}
 
-            if entry.file_type().is_dir() {
-                if created_dirs.insert(target.as_path().into()) {
-                    std::fs::create_dir_all(&target)?;
-                }
-                continue;
-            }
+fn ensure_parent(
+    target: &Path,
+    created_dirs: &mut HashSet<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = target.parent() {
+        if created_dirs.insert(parent.to_path_buf()) {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
 
-            if let Some(parent) = target.parent() {
-                if created_dirs.insert(parent.into()) {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
+/// Place a file via reflink (CoW) → hardlink → copy fallback.
+fn place_file(
+    source: &Path,
+    target: &Path,
+    assume_fresh: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !assume_fresh && target.exists() {
+        std::fs::remove_file(target)?;
+    }
+    if reflink_copy::reflink(source, target).is_ok() {
+        return Ok(());
+    }
+    if std::fs::hard_link(source, target).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(source, target)?;
+    Ok(())
+}
 
-            if !assume_fresh && target.exists() {
-                std::fs::remove_file(&target)?;
+/// Install a bundled `*.data/scripts/` file: copy it (not hardlink, since we
+/// may rewrite the shebang), fix a `#!python` shebang, and set the exec bit.
+fn install_script_file(
+    source: &Path,
+    target: &Path,
+    layout: &VenvLayout,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(source)?.read_to_end(&mut bytes)?;
+
+    // Rewrite a leading `#!...python...` shebang to the venv interpreter.
+    if bytes.starts_with(b"#!") {
+        if let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
+            let first = String::from_utf8_lossy(&bytes[..nl]);
+            if first.contains("python") {
+                let new_shebang = format!("#!{}", layout.python_exe.display());
+                let mut rewritten = new_shebang.into_bytes();
+                rewritten.extend_from_slice(&bytes[nl..]);
+                bytes = rewritten;
             }
-            if reflink_copy::reflink(entry.path(), &target).is_ok() {
-                continue;
-            }
-            if std::fs::hard_link(entry.path(), &target).is_ok() {
-                continue;
-            }
-            std::fs::copy(entry.path(), &target)?;
         }
     }
 
+    if target.exists() {
+        std::fs::remove_file(target)?;
+    }
+    std::fs::write(target, &bytes)?;
+    set_executable(target)?;
     Ok(())
+}
+
+/// A console/gui script entry point parsed from `entry_points.txt`.
+struct EntryScript {
+    name: String,
+    module: String,
+    attr: String,
+    gui: bool,
+}
+
+/// Parse `[console_scripts]` / `[gui_scripts]` sections from `entry_points.txt`.
+fn parse_entry_point_scripts(content: &str) -> Vec<EntryScript> {
+    let mut out = Vec::new();
+    let mut section = String::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(sec) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = sec.trim().to_string();
+            continue;
+        }
+        let gui = match section.as_str() {
+            "console_scripts" => false,
+            "gui_scripts" => true,
+            _ => continue,
+        };
+        let Some((name, target)) = line.split_once('=') else { continue };
+        let name = name.trim();
+        // Strip any `[extras]` suffix from the target.
+        let target = target.split('[').next().unwrap_or("").trim();
+        let Some((module, attr)) = target.split_once(':') else { continue };
+        let (module, attr) = (module.trim(), attr.trim());
+        if name.is_empty() || module.is_empty() || attr.is_empty() {
+            continue;
+        }
+        out.push(EntryScript {
+            name: name.to_string(),
+            module: module.to_string(),
+            attr: attr.to_string(),
+            gui,
+        });
+    }
+    out
+}
+
+/// Generate a launcher for a console/gui script and return its path.
+fn generate_launcher(
+    layout: &VenvLayout,
+    script: &EntryScript,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    std::fs::create_dir_all(&layout.scripts)?;
+    let import_root = script.attr.split('.').next().unwrap_or(&script.attr);
+
+    if cfg!(windows) {
+        // Best-effort Windows launcher: a .bat that invokes the venv python.
+        let target = layout.scripts.join(format!("{}.bat", script.name));
+        let body = format!(
+            "@echo off\r\n\"{}\" -c \"import sys; from {} import {}; sys.exit({}())\" %*\r\n",
+            layout.python_exe.display(),
+            script.module,
+            import_root,
+            script.attr,
+        );
+        std::fs::write(&target, body)?;
+        return Ok(target);
+    }
+
+    let target = layout.scripts.join(&script.name);
+    let _ = script.gui; // POSIX launcher is identical for console/gui.
+    let body = format!(
+        "#!{python}\n\
+         # -*- coding: utf-8 -*-\n\
+         # Generated by vyp.\n\
+         import re\n\
+         import sys\n\
+         from {module} import {import_root}\n\
+         if __name__ == \"__main__\":\n\
+         \x20   sys.argv[0] = re.sub(r\"(-script\\.pyw?|\\.exe)?$\", \"\", sys.argv[0])\n\
+         \x20   sys.exit({attr}())\n",
+        python = layout.python_exe.display(),
+        module = script.module,
+        import_root = import_root,
+        attr = script.attr,
+    );
+    std::fs::write(&target, body)?;
+    set_executable(&target)?;
+    Ok(target)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Build a RECORD entry for an installed file (path relative to site-packages,
+/// sha256 digest, size).
+fn record_entry(
+    layout: &VenvLayout,
+    target: &Path,
+) -> Result<Option<RecordEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    let meta = match std::fs::metadata(target) {
+        Ok(m) if m.is_file() => m,
+        _ => return Ok(None),
+    };
+    let mut hasher = Sha256::new();
+    let mut f = std::fs::File::open(target)?;
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let hash = format!("sha256={}", base64_urlsafe_nopad(&digest));
+    let rel = relative_to(&layout.site_packages, target);
+    Ok(Some(RecordEntry { rel, hash, size: meta.len() }))
+}
+
+/// Write the `.dist-info/RECORD` manifest (RECORD lists itself with no hash).
+fn write_record(
+    layout: &VenvLayout,
+    dist_info: &Path,
+    records: &mut Vec<RecordEntry>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let record_path = layout.site_packages.join(dist_info).join("RECORD");
+    let record_rel = relative_to(&layout.site_packages, &record_path);
+
+    let mut out = String::new();
+    for r in records.iter() {
+        out.push_str(&format!("{},{},{}\n", csv_quote(&r.rel), r.hash, r.size));
+    }
+    out.push_str(&format!("{},,\n", csv_quote(&record_rel)));
+    std::fs::write(&record_path, out)?;
+    Ok(())
+}
+
+/// Compute `target` relative to `base`, emitting `../` segments as needed and
+/// using forward slashes (RECORD/uninstall path format).
+pub fn relative_to(base: &Path, target: &Path) -> String {
+    let base_c: Vec<_> = base.components().collect();
+    let targ_c: Vec<_> = target.components().collect();
+    let mut i = 0;
+    while i < base_c.len() && i < targ_c.len() && base_c[i] == targ_c[i] {
+        i += 1;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for _ in i..base_c.len() {
+        parts.push("..".to_string());
+    }
+    for c in &targ_c[i..] {
+        parts.push(c.as_os_str().to_string_lossy().to_string());
+    }
+    parts.join("/")
+}
+
+fn csv_quote(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Verify that an extracted wheel's `*.dist-info/METADATA` declares the
+/// expected distribution name and version. Used as a defense-in-depth check
+/// when the lock has no integrity hash to pin (a matching sha256 is a stronger
+/// guarantee and makes this redundant). Normalizes names before comparing.
+pub fn verify_wheel_identity(
+    archive_dir: &Path,
+    expected_name: &str,
+    expected_version: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let metadata_path = walkdir::WalkDir::new(archive_dir)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.path()
+                .to_string_lossy()
+                .ends_with(".dist-info/METADATA")
+        });
+    let Some(entry) = metadata_path else {
+        // No METADATA found (unusual); don't block the install on it.
+        return Ok(());
+    };
+
+    let content = std::fs::read_to_string(entry.path())?;
+    let mut got_name = None;
+    let mut got_version = None;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("Name:") {
+            got_name = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Version:") {
+            got_version = Some(v.trim().to_string());
+        }
+        if line.is_empty() {
+            break; // headers end at the first blank line
+        }
+    }
+
+    if let Some(name) = &got_name {
+        let norm = |s: &str| s.to_lowercase().replace(['-', '.', '_'], "_");
+        if norm(name) != norm(expected_name) {
+            return Err(format!(
+                "wheel identity mismatch: expected name '{}', wheel declares '{}'",
+                expected_name, name
+            )
+            .into());
+        }
+    }
+    if let Some(version) = &got_version {
+        if version != expected_version {
+            return Err(format!(
+                "wheel identity mismatch for {}: expected version '{}', wheel declares '{}'",
+                expected_name, expected_version, version
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn top_level_dir_with_suffix(files: &[PathBuf], suffix: &str) -> Option<PathBuf> {
+    for f in files {
+        if let Some(first) = f.components().next() {
+            let name = first.as_os_str().to_string_lossy();
+            if name.ends_with(suffix) {
+                return Some(PathBuf::from(first.as_os_str()));
+            }
+        }
+    }
+    None
+}
+
+/// URL-safe base64 without padding (the RECORD hash encoding per PEP 376).
+fn base64_urlsafe_nopad(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6 & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_console_scripts() {
+        let content = "\
+[console_scripts]
+black = black:patched_main
+blackd = blackd:main [d]
+
+[gui_scripts]
+napari = napari.__main__:main
+
+[other]
+ignored = x:y
+";
+        let scripts = parse_entry_point_scripts(content);
+        assert_eq!(scripts.len(), 3);
+        assert_eq!(scripts[0].name, "black");
+        assert_eq!(scripts[0].module, "black");
+        assert_eq!(scripts[0].attr, "patched_main");
+        assert!(!scripts[0].gui);
+        assert_eq!(scripts[1].name, "blackd");
+        assert_eq!(scripts[1].attr, "main");
+        assert!(scripts[2].gui);
+        assert_eq!(scripts[2].module, "napari.__main__");
+    }
+
+    #[test]
+    fn base64_matches_known_vector() {
+        // sha256("") urlsafe-b64 nopad, as pip writes for empty files.
+        let digest = Sha256::digest(b"");
+        let enc = base64_urlsafe_nopad(&digest);
+        assert_eq!(enc, "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU");
+    }
+
+    #[test]
+    fn relative_path_same_dir() {
+        let base = Path::new("/venv/lib/python3.11/site-packages");
+        let target = Path::new("/venv/lib/python3.11/site-packages/requests/__init__.py");
+        assert_eq!(relative_to(base, target), "requests/__init__.py");
+    }
+
+    #[test]
+    fn relative_path_to_bin() {
+        let base = Path::new("/venv/lib/python3.11/site-packages");
+        let target = Path::new("/venv/bin/black");
+        assert_eq!(relative_to(base, target), "../../../bin/black");
+    }
 }

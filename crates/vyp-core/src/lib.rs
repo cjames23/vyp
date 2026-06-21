@@ -73,6 +73,9 @@ pub struct ResolveTiming {
 pub struct WheelUrlInfo {
     pub filename: String,
     pub url: String,
+    /// Integrity hashes published by the index (algo -> hex digest), pinned
+    /// into the lock file for supply-chain verification at install time.
+    pub hashes: std::collections::BTreeMap<String, String>,
 }
 
 /// Controls how versions are sorted during resolution.
@@ -493,8 +496,12 @@ impl ResolverBuilder {
                 let wheel_url_start = Instant::now();
                 let mut wheel_urls = HashMap::new();
                 for (name, version) in &packages {
-                    if let Some((filename, url)) = plugin_loader.providers.wheel_url(name, version) {
-                        wheel_urls.insert(name.clone(), WheelUrlInfo { filename, url });
+                    if let Some(dist) = plugin_loader.providers.wheel_dist(name, version) {
+                        wheel_urls.insert(name.clone(), WheelUrlInfo {
+                            filename: dist.filename,
+                            url: dist.url,
+                            hashes: dist.hashes.into_iter().collect(),
+                        });
                     }
                 }
                 let wheel_url_ns = wheel_url_start.elapsed().as_nanos();

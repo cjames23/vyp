@@ -25,6 +25,18 @@ pub struct PackageVersions {
     pub versions: Vec<VypVersion>,
 }
 
+/// A selected wheel distribution for a resolved package+version, including the
+/// integrity hashes published by the index so they can be pinned in the lock
+/// file (PEP 751) rather than re-derived at install time.
+#[derive(Debug, Clone)]
+pub struct WheelDist {
+    pub filename: String,
+    pub url: String,
+    /// Hash algorithm name -> hex digest, e.g. `{"sha256": "abc…"}`.
+    pub hashes: HashMap<String, String>,
+    pub size: Option<u64>,
+}
+
 /// Controls where package metadata comes from.
 ///
 /// The default implementation queries PyPI Simple API.
@@ -91,6 +103,23 @@ pub trait MetadataProvider: Send + Sync + Debug {
         _version: &VypVersion,
     ) -> Option<(String, String)> {
         None
+    }
+
+    /// Return the best wheel distribution (filename, URL, hashes, size) for a
+    /// resolved package+version. The default falls back to [`wheel_url`] with
+    /// no hashes, so existing providers keep working; index providers override
+    /// it to pin integrity hashes into the lock file.
+    fn wheel_dist(
+        &self,
+        package: &str,
+        version: &VypVersion,
+    ) -> Option<WheelDist> {
+        self.wheel_url(package, version).map(|(filename, url)| WheelDist {
+            filename,
+            url,
+            hashes: HashMap::new(),
+            size: None,
+        })
     }
 
     /// Return profiling counters (disk hits, 304s, network fetches, etc.).

@@ -125,7 +125,11 @@ impl PyLockFile {
                         name: info.filename.clone(),
                         url: Some(info.url.clone()),
                         size: None,
-                        hashes: None,
+                        hashes: if info.hashes.is_empty() {
+                            None
+                        } else {
+                            Some(info.hashes.clone())
+                        },
                     }])
                     .unwrap_or_default();
 

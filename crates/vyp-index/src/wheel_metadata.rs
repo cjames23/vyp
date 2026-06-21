@@ -57,7 +57,9 @@ async fn range_get(
     url: &str,
     range: &str,
 ) -> Result<Chunk, DynError> {
-    let resp = client.get(url).header(RANGE, range).send().await?;
+    let resp = crate::auth::apply_auth(client.get(url).header(RANGE, range), url)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(format!("range fetch failed: {}", resp.status()).into());
     }

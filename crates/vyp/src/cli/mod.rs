@@ -9,6 +9,8 @@ pub mod conflict;
 pub mod override_cmd;
 pub mod plugin_cmd;
 pub mod install;
+pub mod uninstall;
+pub mod sync;
 
 use clap::Subcommand;
 
@@ -22,6 +24,10 @@ pub enum Commands {
     Lock(lock::LockArgs),
     /// Resolve and install packages into a virtual environment
     Install(install::InstallArgs),
+    /// Remove installed packages from a virtual environment
+    Uninstall(uninstall::UninstallArgs),
+    /// Make a virtual environment exactly match the lock (install + prune)
+    Sync(sync::SyncArgs),
     /// Explain why a package version was chosen
     Explain(explain::ExplainArgs),
     /// Compare two lock files
@@ -42,6 +48,8 @@ pub fn run(command: Commands) -> miette::Result<()> {
         Commands::Resolve(args) => resolve::run(args),
         Commands::Lock(args) => lock::run(args),
         Commands::Install(args) => install::run(args),
+        Commands::Uninstall(args) => uninstall::run(args),
+        Commands::Sync(args) => sync::run(args),
         Commands::Explain(args) => explain::run(args),
         Commands::Diff(args) => diff::run(args),
         Commands::Conflict(args) => conflict::run(args),

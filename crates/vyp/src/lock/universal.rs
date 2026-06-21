@@ -157,6 +157,10 @@ fn wheel_info_to_lock_wheels(info: &WheelUrlInfo) -> Vec<PyLockWheel> {
         name: info.filename.clone(),
         url: Some(info.url.clone()),
         size: None,
-        hashes: None,
+        hashes: if info.hashes.is_empty() {
+            None
+        } else {
+            Some(info.hashes.clone())
+        },
     }]
 }
