@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use vyp_api::MarkerEnvironment;
@@ -9,12 +10,18 @@ use vyp_api::MarkerEnvironment;
 /// most-preferred to least-preferred. A wheel's preference rank is derived
 /// from the *position* of its best-matching tag in each list (earlier =
 /// better), mirroring `packaging.tags` ordering so that "most specific
-/// compatible tag wins" falls out naturally.
+/// compatible tag wins" falls out naturally. The parallel `*_set` fields give
+/// O(1) membership for the hot `is_compatible` check (called once per wheel
+/// across the whole resolve); the ordered vectors are only consulted by the
+/// rarely-called `compatibility_score`.
 #[derive(Debug, Clone)]
 pub struct PlatformTags {
     python_tags: Vec<String>,
     abi_tags: Vec<String>,
     platform_tags: Vec<String>,
+    python_set: HashSet<String>,
+    abi_set: HashSet<String>,
+    platform_set: HashSet<String>,
 }
 
 impl PlatformTags {
@@ -28,7 +35,18 @@ impl PlatformTags {
         let abi_tags = build_abi_tags(&impl_name, major, minor, free_threaded);
         let platform_tags = build_platform_tags(&env.sys_platform, &env.platform_machine);
 
-        Self { python_tags, abi_tags, platform_tags }
+        let python_set = python_tags.iter().cloned().collect();
+        let abi_set = abi_tags.iter().cloned().collect();
+        let platform_set = platform_tags.iter().cloned().collect();
+
+        Self {
+            python_tags,
+            abi_tags,
+            platform_tags,
+            python_set,
+            abi_set,
+            platform_set,
+        }
     }
 
     /// Split a wheel filename into its (python, abi, platform) tag fields,
@@ -61,11 +79,9 @@ impl PlatformTags {
             return false;
         };
 
-        let py_ok = best_rank(py_tag, &self.python_tags).is_some();
-        let abi_ok = best_rank(abi_tag, &self.abi_tags).is_some();
-        let plat_ok = best_rank(plat_tag, &self.platform_tags).is_some();
-
-        py_ok && abi_ok && plat_ok
+        any_member(py_tag, &self.python_set)
+            && any_member(abi_tag, &self.abi_set)
+            && any_member(plat_tag, &self.platform_set)
     }
 
     /// Score a wheel for preference ordering. Higher is better; `0` for an
@@ -98,6 +114,11 @@ impl PlatformTags {
         // +1 so a perfectly-compatible wheel always scores > 0.
         1 + plat_pref * 10_000 + abi_pref * 100 + py_pref
     }
+}
+
+/// O(1) membership: whether any `.`-joined sub-tag of `wheel_tag` is supported.
+fn any_member(wheel_tag: &str, supported: &HashSet<String>) -> bool {
+    wheel_tag.split('.').any(|sub| supported.contains(sub))
 }
 
 /// Return the position (0 = best) of the wheel tag's best match within the
@@ -418,6 +439,8 @@ fn parse_musl_version(text: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
 
     fn arm64_mac_env() -> MarkerEnvironment {
         MarkerEnvironment {

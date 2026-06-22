@@ -58,6 +58,14 @@ pub struct PyPIMetadataProvider {
     runtime: Arc<tokio::runtime::Runtime>,
     disk_cache: Arc<Mutex<crate::cache::MetadataCache>>,
     marker_env: MarkerEnvironment,
+    /// Platform tags for `marker_env`, built once (fixed for this provider's
+    /// lifetime) so version filtering and wheel selection don't rebuild them
+    /// on every call on the solver hot path.
+    platform_tags: PlatformTags,
+    /// Target interpreter version for `Requires-Python` checks.
+    target_python: Option<VypVersion>,
+    /// Memoized `Requires-Python` specifier evaluations, keyed by specifier.
+    rp_cache: Mutex<HashMap<String, bool>>,
     semaphore: Arc<Semaphore>,
     profile_counters: Arc<Mutex<ProfileCounters>>,
 }
@@ -129,6 +137,9 @@ impl PyPIMetadataProvider {
 
         let client = shared_client.unwrap_or_else(Self::build_default_client);
 
+        let platform_tags = PlatformTags::from_env(&marker_env);
+        let target_python = marker_env.python_full_version.parse::<VypVersion>().ok();
+
         Self {
             provider_name: name.to_string(),
             index_url: index_url_owned,
@@ -138,9 +149,33 @@ impl PyPIMetadataProvider {
             runtime: shared_runtime(),
             disk_cache,
             marker_env,
+            platform_tags,
+            target_python,
+            rp_cache: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES)),
             profile_counters: Arc::new(Mutex::new(ProfileCounters::default())),
         }
+    }
+
+    /// Drop versions with no installable distribution for the target
+    /// environment, reusing the provider's prebuilt tags and memo cache.
+    fn filter_viable(
+        &self,
+        versions: &mut Vec<VypVersion>,
+        wheel_info: &HashMap<VypVersion, Vec<WheelInfo>>,
+    ) {
+        if crate::version_filter::wheel_filter_disabled() {
+            return;
+        }
+        let Some(target) = &self.target_python else { return };
+        let mut cache = self.rp_cache.lock().expect("poisoned");
+        crate::version_filter::filter_versions_with(
+            versions,
+            wheel_info,
+            &self.platform_tags,
+            target,
+            &mut cache,
+        );
     }
 
     /// Return the underlying HTTP client. `reqwest::Client` is `Arc`-based so
@@ -932,7 +967,7 @@ impl MetadataProvider for PyPIMetadataProvider {
         let result = self.index.wait_versions(&normalized);
 
         let mut versions = result.versions.clone();
-        crate::version_filter::filter_versions(&mut versions, &result.wheel_info, &self.marker_env);
+        self.filter_viable(&mut versions, &result.wheel_info);
 
         if versions.is_empty() {
             // Distinguish a real transport failure from "no such package": only
@@ -1049,7 +1084,7 @@ impl MetadataProvider for PyPIMetadataProvider {
         let normalized = package.name().to_lowercase().replace(['-', '.'], "_");
         let result = self.index.try_get_versions(&normalized)?;
         let mut versions = result.versions.clone();
-        crate::version_filter::filter_versions(&mut versions, &result.wheel_info, &self.marker_env);
+        self.filter_viable(&mut versions, &result.wheel_info);
         if versions.is_empty() {
             None
         } else {
@@ -1075,7 +1110,7 @@ impl MetadataProvider for PyPIMetadataProvider {
     ) -> Option<vyp_api::WheelDist> {
         let normalized = package.to_lowercase().replace(['-', '.'], "_");
         let wheels = self.index.get_wheel_info(&normalized, version)?;
-        let tags = PlatformTags::from_env(&self.marker_env);
+        let tags = &self.platform_tags;
 
         let mut best: Option<(u32, &WheelInfo)> = None;
         for w in &wheels {
